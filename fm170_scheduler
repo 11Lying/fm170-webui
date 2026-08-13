@@ -1,0 +1,1076 @@
+#!/bin/sh
+
+# FM170-EAU dual-port AT scheduler.
+#
+# Port A: realtime status + short control commands.
+# Port B: long-running GTCELLSCAN jobs only.
+#
+# The master process owns lifecycle management. Each port has exactly one
+# worker process and exactly one serial file descriptor, so CGI scripts never
+# open the modem serial ports directly.
+
+PORT_A="${FM170_PORT_A:-/dev/ttyUSB2}"
+PORT_B="${FM170_PORT_B:-/dev/ttyUSB1}"
+
+STATE_DIR="${FM170_STATE_DIR:-/tmp/fm170}"
+STATUS_FILE="$STATE_DIR/status.json"
+ERROR_FILE="$STATE_DIR/status_error.json"
+PORTS_FILE="$STATE_DIR/ports.json"
+PORTS_LOCK="$STATE_DIR/ports.lock"
+CTRL_QUEUE="$STATE_DIR/control"
+
+SCAN_REQUEST="$STATE_DIR/cellscan_request.json"
+SCAN_STATUS="$STATE_DIR/cellscan_status.json"
+SCAN_RESULT="$STATE_DIR/cellscan_result.json"
+SCAN_RESULT_PERSIST="${FM170_RESULT_PERSIST:-/etc/fm170/cellscan_result.json}"
+SCAN_EMPTY_LAST="$STATE_DIR/cellscan_empty_last.json"
+SCAN_PARTIAL="$STATE_DIR/cellscan_partial.json"
+SCAN_RAW="$STATE_DIR/cellscan_raw.txt"
+
+LOG_FILE="$STATE_DIR/scheduler.log"
+PID_FILE="/var/run/fm170_scheduler.pid"
+MASTER_LOCK="$STATE_DIR/scheduler.lock"
+A_PID_FILE="/var/run/fm170_scheduler_a.pid"
+B_PID_FILE="/var/run/fm170_scheduler_b.pid"
+
+STATUS_INTERVAL="${FM170_STATUS_INTERVAL:-3}"
+SCAN_TIMEOUT="${FM170_SCAN_TIMEOUT:-185}"
+SCAN_ATTEMPT_TIMEOUT="${FM170_SCAN_ATTEMPT_TIMEOUT:-180}"
+SCAN_MAX_ATTEMPTS="${FM170_SCAN_MAX_ATTEMPTS:-3}"
+SCAN_RETRY_DELAY="${FM170_SCAN_RETRY_DELAY:-5}"
+SCAN_QUIET_SECONDS="${FM170_SCAN_QUIET_SECONDS:-20}"
+CONTROL_TIMEOUT="${FM170_CONTROL_TIMEOUT:-8}"
+SCAN_STARTED_TEXT=""
+SCAN_TRIGGER="manual"
+CURRENT_ATTEMPT=1
+CURRENT_MAX_ATTEMPTS=2
+
+NL='
+'
+
+case "$STATUS_INTERVAL" in
+  ''|*[!0-9]*) STATUS_INTERVAL=3 ;;
+esac
+if [ "$STATUS_INTERVAL" -lt 1 ]; then
+  STATUS_INTERVAL=3
+fi
+case "$SCAN_TIMEOUT" in
+  ''|*[!0-9]*) SCAN_TIMEOUT=185 ;;
+esac
+if [ "$SCAN_TIMEOUT" -lt 1 ]; then
+  SCAN_TIMEOUT=185
+fi
+  case "$SCAN_ATTEMPT_TIMEOUT" in
+    ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=180 ;;
+esac
+if [ "$SCAN_ATTEMPT_TIMEOUT" -lt 1 ] || [ "$SCAN_ATTEMPT_TIMEOUT" -gt "$SCAN_TIMEOUT" ]; then
+  SCAN_ATTEMPT_TIMEOUT="$SCAN_TIMEOUT"
+fi
+  case "$SCAN_MAX_ATTEMPTS" in
+    ''|*[!0-9]*) SCAN_MAX_ATTEMPTS=3 ;;
+esac
+if [ "$SCAN_MAX_ATTEMPTS" -lt 1 ]; then
+  SCAN_MAX_ATTEMPTS=1
+fi
+if [ "$SCAN_MAX_ATTEMPTS" -gt 5 ]; then
+  SCAN_MAX_ATTEMPTS=5
+fi
+case "$SCAN_RETRY_DELAY" in
+  ''|*[!0-9]*) SCAN_RETRY_DELAY=5 ;;
+esac
+if [ "$SCAN_RETRY_DELAY" -lt 1 ]; then
+  SCAN_RETRY_DELAY=5
+fi
+case "$SCAN_QUIET_SECONDS" in
+  ''|*[!0-9]*) SCAN_QUIET_SECONDS=20 ;;
+esac
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+write_ports() {
+  a_state="$1"
+  a_command="$2"
+  a_job="$3"
+  b_state="$4"
+  b_command="$5"
+  b_job="$6"
+  (
+    exec 8>"$PORTS_LOCK"
+    flock 8
+    tmp_file="$PORTS_FILE.tmp.$$.$(date +%s)"
+    updated_at="$(date '+%Y-%m-%d %H:%M:%S')"
+    jq -n \
+      --arg aState "$a_state" \
+      --arg aCommand "$a_command" \
+      --arg aJob "$a_job" \
+      --arg bState "$b_state" \
+      --arg bCommand "$b_command" \
+      --arg bJob "$b_job" \
+      --arg aPort "$PORT_A" \
+      --arg bPort "$PORT_B" \
+      --arg updatedAt "$updated_at" \
+      '{ok:true,A:{state:$aState,currentCommand:$aCommand,currentJobId:$aJob,port:$aPort,startedAt:$updatedAt,lastActivity:$updatedAt,lastError:""},B:{state:$bState,currentCommand:$bCommand,currentJobId:$bJob,port:$bPort,startedAt:$updatedAt,lastActivity:$updatedAt,lastError:""},updatedAt:$updatedAt}' \
+      > "$tmp_file"
+    if [ -s "$tmp_file" ]; then
+      mv "$tmp_file" "$PORTS_FILE"
+    else
+      rm -f "$tmp_file"
+      log "write_ports failed a=$a_state b=$b_state"
+    fi
+  )
+}
+
+update_port_state() {
+  port_name="$1"
+  state="$2"
+  state_command="$3"
+  job="${4:-}"
+  case "$port_name" in
+    A|B) ;;
+    *) return 1 ;;
+  esac
+  (
+    exec 8>"$PORTS_LOCK"
+    flock 8
+    updated_at="$(date '+%Y-%m-%d %H:%M:%S')"
+    tmp_file="$PORTS_FILE.tmp.$$.$(date +%s)"
+    if [ -f "$PORTS_FILE" ]; then
+      jq --arg port "$port_name" \
+        --arg state "$state" \
+        --arg command "$state_command" \
+        --arg job "$job" \
+        --arg updatedAt "$updated_at" \
+        '.updatedAt=$updatedAt | .[$port].state=$state | .[$port].currentCommand=$command | .[$port].currentJobId=$job | .[$port].startedAt=$updatedAt | .[$port].lastActivity=$updatedAt | .[$port].lastError=""' \
+        "$PORTS_FILE" > "$tmp_file" 2>/dev/null
+    elif [ "$port_name" = "A" ]; then
+      jq -n \
+        --arg aState "$state" \
+        --arg aCommand "$state_command" \
+        --arg aJob "$job" \
+        --arg aPort "$PORT_A" \
+        --arg bPort "$PORT_B" \
+        --arg updatedAt "$updated_at" \
+        '{ok:true,A:{state:$aState,currentCommand:$aCommand,currentJobId:$aJob,port:$aPort,startedAt:$updatedAt,lastActivity:$updatedAt,lastError:""},B:{state:"ready",currentCommand:"",currentJobId:"",port:$bPort,startedAt:$updatedAt,lastActivity:$updatedAt,lastError:""},updatedAt:$updatedAt}' \
+        > "$tmp_file"
+    else
+      jq -n \
+        --arg bState "$state" \
+        --arg bCommand "$state_command" \
+        --arg bJob "$job" \
+        --arg aPort "$PORT_A" \
+        --arg bPort "$PORT_B" \
+        --arg updatedAt "$updated_at" \
+        '{ok:true,A:{state:"ready",currentCommand:"",currentJobId:"",port:$aPort,startedAt:$updatedAt,lastActivity:$updatedAt,lastError:""},B:{state:$bState,currentCommand:$bCommand,currentJobId:$bJob,port:$bPort,startedAt:$updatedAt,lastActivity:$updatedAt,lastError:""},updatedAt:$updatedAt}' \
+        > "$tmp_file"
+    fi
+    if [ -s "$tmp_file" ]; then
+      mv "$tmp_file" "$PORTS_FILE"
+    else
+      rm -f "$tmp_file"
+      log "update_port_state failed port=$port_name state=$state"
+    fi
+  )
+}
+
+write_port_a() {
+  update_port_state A "$1" "$2" ""
+}
+
+write_port_b() {
+  update_port_state B "$1" "$2" "${3:-}"
+}
+
+hex_or_dec() {
+  value="$1"
+  case "$value" in
+    ''|*[!0-9a-fA-F]*) echo 0 ;;
+    *[a-fA-F]*|0x*) printf '%d' "0x$value" 2>/dev/null || echo 0 ;;
+    *) echo "$value" ;;
+  esac
+}
+
+is_integer() {
+  value="$1"
+  case "$value" in
+    ''|*[!0-9-]*) return 1 ;;
+    -) return 1 ;;
+    -[0-9]*) return 0 ;;
+    *[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+drain_fd() {
+  fd="$1"
+  drain_start="$(date +%s)"
+  drain_deadline=$((drain_start + 1))
+  while [ "$(date +%s)" -lt "$drain_deadline" ]; do
+    IFS= read -r -t 1 _drain_line <&$fd
+  done
+}
+
+open_port() {
+  fd="$1"
+  port="$2"
+  eval "exec $fd<&-" 2>/dev/null
+  eval "exec $fd<>\"$port\"" 2>/dev/null || return 1
+  if ! stty -F "$port" 115200 raw -echo <&$fd >/dev/null 2>&1; then
+    stty raw -echo <&$fd >/dev/null 2>&1
+  fi
+  drain_fd "$fd"
+  return 0
+}
+
+# ---- socat 统一串口访问(经 fm170_at.sh, flock 全局锁, 有序不抢占) ----
+read_at() {
+  fd="$1"
+  cmd="$2"
+  timeout_seconds="$3"
+  AT_RESPONSE=""
+  # worker-a 的串口 = PORT_A (ttyUSB2); 统一走 socat
+  AT_RESPONSE="$(/usr/sbin/fm170_at.sh "$PORT_A" "$timeout_seconds" "$cmd" 2>/dev/null)"
+  case "$AT_RESPONSE" in
+    *OK*) return 0 ;;
+    *ERROR*) return 1 ;;
+  esac
+  return 1
+}
+
+query_at() {
+  read_at 5 "$1" "$2"
+}
+
+optional_query() {
+  var_name="$1"
+  cmd="$2"
+  timeout_seconds="$3"
+  if read_at 5 "$cmd" "$timeout_seconds"; then
+    eval "$var_name=\$AT_RESPONSE"
+  fi
+}
+
+write_status() {
+  phase="$1"
+  message="$2"
+  now_epoch="$(date +%s)"
+  now_text="$(date '+%Y-%m-%d %H:%M:%S')"
+  tmp_file="$STATUS_FILE.tmp"
+
+  jq -n \
+    --arg phase "$phase" \
+    --arg message "$message" \
+    --arg updatedAt "$now_text" \
+    --arg cachedAt "$now_text" \
+    --arg epoch "$now_epoch" \
+    --arg port "$PORT_A" \
+    --arg statusPort "$PORT_A" \
+    --arg controlPort "$PORT_B" \
+    --arg cgmm "$CGMM" \
+    --arg cgmr "$CGMR" \
+    --arg gtact "$GTACT" \
+    --arg gtactTest "$GTACTTEST" \
+    --arg cereg "$CEREG" \
+    --arg c5greg "$C5GREG" \
+    --arg cgreg "$CGREG" \
+    --arg cemode "$CEMODE" \
+    --arg cops "$COPS" \
+    --arg cesq "$CESQ" \
+    --arg gtccinfo "$GTCCINFO" \
+    --arg gtcaInfo "$GTCAINFO" \
+    --arg gtcellinfo "$GTCELLINFO" \
+    --arg celllock "$CELLLOCK" \
+    --arg plmnlock "$PLMNLOCK" \
+    --arg roamcfg "$ROAMCFG" \
+    --arg dualsim "$DUALSIM" \
+    --arg cgdcont "$CGDCONT" \
+    --arg cgcontrdp "$CGCONTRDP" \
+    '{ok:true,fresh:true,source:"scheduler",phase:$phase,message:$message,updatedAt:$updatedAt,cachedAt:$cachedAt,epoch:($epoch|tonumber),port:$port,statusPort:$statusPort,controlPort:$controlPort,raw:{CGMM:$cgmm,CGMR:$cgmr,GTACT:$gtact,GTACTTEST:$gtactTest,CEREG:$cereg,C5GREG:$c5greg,CGREG:$cgreg,CEMODE:$cemode,COPS:$cops,CESQ:$cesq,GTCCINFO:$gtccinfo,GTCAINFO:$gtcaInfo,GTCELLINFO:$gtcellinfo,CELLLOCK:$celllock,PLMNLOCK:$plmnlock,ROAMCFG:$roamcfg,DUALSIM:$dualsim,CGDCONT:$cgdcont,CGCONTRDP:$cgcontrdp}}' \
+    > "$tmp_file"
+  if [ -s "$tmp_file" ]; then
+    mv "$tmp_file" "$STATUS_FILE"
+  else
+    rm -f "$tmp_file"
+    log "write_status failed phase=$phase"
+  fi
+}
+
+write_error() {
+  phase="$1"
+  message="$2"
+  now_epoch="$(date +%s)"
+  now_text="$(date '+%Y-%m-%d %H:%M:%S')"
+  tmp_file="$ERROR_FILE.tmp"
+  log "status query failed phase=$phase message=$message"
+  jq -n \
+    --arg phase "$phase" \
+    --arg message "$message" \
+    --arg updatedAt "$now_text" \
+    --arg epoch "$now_epoch" \
+    --arg error "$message" \
+    '{ok:false,fresh:false,phase:$phase,message:$message,updatedAt:$updatedAt,epoch:($epoch|tonumber),error:$error}' \
+    > "$tmp_file"
+  if [ -s "$tmp_file" ]; then
+    mv "$tmp_file" "$ERROR_FILE"
+  else
+    rm -f "$tmp_file"
+    log "write_error failed phase=$phase"
+  fi
+}
+
+# ---- Phase1：AT 查询频率分级 ----
+# 高频（每 tick）：GTACT / CEREG / C5GREG / CESQ / GTCCINFO / GTCELLLOCK
+# 中频（每 MID_INTERVAL 秒）：CGREG / COPS / GTCAINFO / GTCELLINFO
+# 低频（每 SLOW_INTERVAL 秒）：CGDCONT / CGCONTRDP / GTPLMNLOCK
+# 初始化（仅一次）：ATE0 / CGMM / CGMR / GTACT=? / CEMODE / GTROAMCFG / GTDUALSIM
+# 静态字段本轮未查询时继续使用上一次成功值；status.json schema 保持不变（全部 raw.* 字段保留）。
+MID_INTERVAL=15
+SLOW_INTERVAL=30
+
+status_init() {
+  # 只在 worker/port 初始化阶段执行一次的静态/初始化 AT 命令。
+  # ATE0 仅用于关闭回显（socat 已 echo=0），无需周期性重发。
+  optional_query ATE0_DUMMY "ATE0" 2
+  optional_query CGMM "AT+CGMM?" 3
+  optional_query CGMR "AT+CGMR?" 3
+  optional_query GTACTTEST "AT+GTACT=?" 5
+  optional_query CEMODE "AT+CEMODE?" 3
+  optional_query ROAMCFG "AT+GTROAMCFG?" 6
+  optional_query DUALSIM "AT+GTDUALSIM?" 5
+}
+
+status_once() {
+  # 由 fm170_at.sh(socat) 每次独立 open/close + flock 锁, 不再常驻 fd
+  now_s="$(date +%s)"
+
+  # 高频组（必须每 tick 采集，失败终止本轮）
+  query_at "AT+GTACT?" 3 || { write_error "query" "AT+GTACT? timeout"; return 1; }
+  GTACT="$AT_RESPONSE"
+  query_at "AT+CEREG?" 3 || { write_error "query" "AT+CEREG? timeout"; return 1; }
+  CEREG="$AT_RESPONSE"
+  query_at "AT+C5GREG?" 3 || { write_error "query" "AT+C5GREG? timeout"; return 1; }
+  C5GREG="$AT_RESPONSE"
+  query_at "AT+CESQ" 3 || { write_error "query" "AT+CESQ timeout"; return 1; }
+  CESQ="$AT_RESPONSE"
+  query_at "AT+GTCCINFO?" 5 || { write_error "query" "AT+GTCCINFO? timeout"; return 1; }
+  GTCCINFO="$AT_RESPONSE"
+  query_at "AT+GTCELLLOCK?" 3 || { write_error "query" "AT+GTCELLLOCK? timeout"; return 1; }
+  CELLLOCK="$AT_RESPONSE"
+
+  # 中频组（CGREG/COPS/GTCAINFO/GTCELLINFO）：每 MID_INTERVAL 秒采集，失败用旧值
+  if [ $((now_s - last_mid_epoch)) -ge "$MID_INTERVAL" ]; then
+    optional_query CGREG "AT+CGREG?" 3
+    optional_query COPS "AT+COPS?" 3
+    optional_query GTCAINFO "AT+GTCAINFO?" 5
+    optional_query GTCELLINFO "AT+GTCELLINFO?" 5
+    last_mid_epoch="$now_s"
+  fi
+
+  # 低频组（CGDCONT/CGCONTRDP/GTPLMNLOCK）：每 SLOW_INTERVAL 秒采集，失败用旧值
+  if [ $((now_s - last_slow_epoch)) -ge "$SLOW_INTERVAL" ]; then
+    optional_query CGDCONT "AT+CGDCONT?" 4
+    optional_query CGCONTRDP "AT+CGCONTRDP" 6
+    optional_query PLMNLOCK "AT+GTPLMNLOCK?" 3
+    last_slow_epoch="$now_s"
+  fi
+
+  rm -f "$ERROR_FILE"
+  write_status "done" ""
+  return 0
+}
+
+scan_is_active() {
+  [ -f "$SCAN_STATUS" ] || return 1
+  current_scan_status="$(jq -r '.status // "idle"' "$SCAN_STATUS" 2>/dev/null || echo idle)"
+  case "$current_scan_status" in
+    starting|running) return 0 ;;
+  esac
+  return 1
+}
+
+command_conflicts_with_scan() {
+  cmd="$1"
+  case "$cmd" in
+    AT+GTCELLLOCK=*|AT+GTFREQLOCK=*|AT+GTACT=*|AT+GTPLMNLOCK=*|AT+CFUN=*) return 0 ;;
+  esac
+  return 1
+}
+
+write_control_response() {
+  response_file="$1"
+  ok_flag="$2"
+  command="$3"
+  error_text="$4"
+  raw_text="$5"
+  tmp_file="$response_file.tmp"
+  jq -n \
+    --arg ok "$ok_flag" \
+    --arg command "$command" \
+    --arg error "$error_text" \
+    --arg raw "$raw_text" \
+    '{ok:($ok == "true"),command:$command,error:$error,raw:$raw,retried:false,attempts:1,retryCommand:"",retryRaw:""}' \
+    > "$tmp_file"
+  if [ -s "$tmp_file" ]; then
+    mv "$tmp_file" "$response_file"
+  else
+    rm -f "$tmp_file"
+    log "write_control_response failed command=$command"
+  fi
+}
+
+next_control_request() {
+  for file in "$CTRL_QUEUE"/req-*.json; do
+    [ -f "$file" ] || continue
+    printf '%s' "$file"
+    return 0
+  done
+  return 1
+}
+
+process_control() {
+  req_file="$1"
+  req="$(cat "$req_file" 2>/dev/null)" || {
+    rm -f "$req_file"
+    return 0
+  }
+  command="$(printf '%s' "$req" | jq -r '.command // ""' 2>/dev/null)"
+  timeout_value="$(printf '%s' "$req" | jq -r '.timeout // 8' 2>/dev/null)"
+  response_file="$(printf '%s' "$req" | jq -r '.responseFile // ""' 2>/dev/null)"
+  action="$(printf '%s' "$req" | jq -r '.action // ""' 2>/dev/null)"
+
+  case "$timeout_value" in
+    ''|*[!0-9]*) timeout_value=8 ;;
+  esac
+  if [ "$timeout_value" -lt 1 ]; then
+    timeout_value=8
+  fi
+
+  write_port_a "busy" "$action $command"
+
+  if command_conflicts_with_scan "$command" && scan_is_active; then
+    write_control_response "$response_file" "false" "$command" \
+      "小区扫描进行中，请等待扫描完成后再修改网络配置。" ""
+    rm -f "$req_file"
+    write_port_a "ready" ""
+    return 0
+  fi
+
+  if ! read_at 5 "$command" "$timeout_value"; then
+    write_control_response "$response_file" "false" "$command" \
+      "AT command timeout" "$AT_RESPONSE"
+    write_port_a "error" "$action $command"
+  else
+    case "$AT_RESPONSE" in
+      *ERROR*)
+        write_control_response "$response_file" "false" "$command" \
+          "AT returned ERROR" "$AT_RESPONSE"
+        ;;
+      *)
+        write_control_response "$response_file" "true" "$command" "" "$AT_RESPONSE"
+        ;;
+    esac
+    write_port_a "ready" ""
+  fi
+  rm -f "$req_file"
+}
+
+worker_a() {
+  echo "$$" > "$A_PID_FILE"
+  consecutive_failures=0
+  last_status_epoch=0
+  last_mid_epoch=0
+  last_slow_epoch=0
+  # 初始化阶段执行一次静态/初始化类 AT（ATE0/CGMM/CGMR/GTACT=?/CEMODE/GTROAMCFG/GTDUALSIM）
+  if [ "$STATIC_INIT_DONE" != "1" ]; then
+    status_init
+    STATIC_INIT_DONE=1
+  fi
+  while :; do
+    if next_control_request; then
+      control_request="$(next_control_request)"
+      # 记录控制命令：若涉及状态类控制（锁频/网络模式/锁PLMN），成功后即时刷新中/低频组
+      ctrl_cmd="$(cat "$control_request" 2>/dev/null | jq -r '.command // ""' 2>/dev/null)"
+      process_control "$control_request"
+      case "$ctrl_cmd" in
+        AT+GTACT=*|AT+GTCELLLOCK=*|AT+GTFREQLOCK=*|AT+GTPLMNLOCK=*|AT+CFUN=*)
+          # 控制成功：强制下一 cycle 重采集（低频字段立即反映新状态）
+          last_mid_epoch=$(( $(date +%s) - "$MID_INTERVAL" ))
+          last_slow_epoch=$(( $(date +%s) - "$SLOW_INTERVAL" ))
+          ;;
+      esac
+      continue
+    fi
+
+    now_epoch="$(date +%s)"
+    if [ "$now_epoch" -lt "$last_status_epoch" ]; then
+      last_status_epoch=0
+    fi
+    if [ $((now_epoch - last_status_epoch)) -ge "$STATUS_INTERVAL" ]; then
+      write_port_a "busy" "STATUS_CYCLE"
+      if status_once; then
+        consecutive_failures=0
+        last_status_epoch="$(date +%s)"
+        write_port_a "ready" ""
+      else
+        consecutive_failures=$((consecutive_failures + 1))
+        if [ "$consecutive_failures" -ge 3 ]; then
+          write_port_a "error" "STATUS_CYCLE"
+          sleep 2
+        fi
+      fi
+    fi
+    sleep 1
+  done
+}
+
+# 单调时钟: /proc/uptime 秒, 不受 NTP 校时跳变影响(设备无RTC)。时长/纪元用它保证稳定。
+mono() {
+  awk '{print int($1)}' /proc/uptime 2>/dev/null || date +%s
+}
+
+write_scan_status() {
+  status="$1"
+  job_id="$2"
+  started_at="$3"
+  elapsed="$4"
+  finished_at="$5"
+  result_count="$6"
+  error_text="$7"
+  now_epoch="$(date +%s)"
+  now_mono="$(mono)"
+  if [ -z "$elapsed" ]; then
+    elapsed=$((now_mono - started_at))
+  fi
+  if [ "$elapsed" -lt 0 ]; then
+    elapsed=0
+  fi
+  # 封顶 elapsed：避免时钟异常/进程挂起导致写入超大值(如 28690s)
+  case "$SCAN_TIMEOUT" in
+    ''|*[!0-9]*) SCAN_TIMEOUT=185 ;;
+  esac
+  max_elapsed=$((SCAN_TIMEOUT + 30))
+  if [ "$elapsed" -gt "$max_elapsed" ]; then
+    elapsed=$max_elapsed
+  fi
+  raw_text="$(cat "$SCAN_RAW" 2>/dev/null || true)"
+  tmp_file="$SCAN_STATUS.tmp"
+  now_epoch="$(date +%s)"
+  jq -n \
+    --arg status "$status" \
+    --arg jobId "$job_id" \
+    --arg startedAt "${SCAN_STARTED_TEXT:-$(date '+%Y-%m-%d %H:%M:%S')}" \
+    --arg trigger "$SCAN_TRIGGER" \
+    --arg finishedAt "$finished_at" \
+    --arg elapsed "$elapsed" \
+    --arg resultCount "$result_count" \
+    --arg error "$error_text" \
+    --arg timeout "$SCAN_TIMEOUT" \
+    --arg attemptTimeout "$SCAN_ATTEMPT_TIMEOUT" \
+    --arg retryDelay "$SCAN_RETRY_DELAY" \
+    --arg attempt "$CURRENT_ATTEMPT" \
+    --arg maxAttempt "$CURRENT_MAX_ATTEMPTS" \
+    --arg port "$PORT_B" \
+    --arg updatedAt "$(date '+%Y-%m-%d %H:%M:%S')" \
+    --arg epoch "$now_epoch" \
+    --arg raw "$raw_text" \
+    '{ok:true,jobId:$jobId,status:$status,trigger:$trigger,startedAt:$startedAt,elapsed:($elapsed|tonumber),finishedAt:(if $finishedAt == "" then null else $finishedAt end),resultCount:($resultCount|tonumber),error:$error,timeout:($timeout|tonumber),attemptTimeout:($attemptTimeout|tonumber),retryDelay:($retryDelay|tonumber),attempts:($attempt|tonumber),maxAttempts:($maxAttempt|tonumber),port:$port,updatedAt:$updatedAt,epoch:($epoch|tonumber),raw:$raw}' \
+    > "$tmp_file"
+  if [ -s "$tmp_file" ]; then
+    mv "$tmp_file" "$SCAN_STATUS"
+  else
+    rm -f "$tmp_file"
+    log "write_scan_status failed status=$status"
+  fi
+}
+
+
+write_scan_result() {
+  status="$1"
+  job_id="$2"
+  started_at="$3"
+  finished_at="$4"
+  duration="$5"
+  result_count="$6"
+  raw_text="$7"
+  cells_json="${8:-[]}"
+  now_epoch="$(date +%s)"
+  if [ -z "$finished_at" ]; then
+    finished_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  fi
+  case "$result_count" in
+    ''|*[!0-9]*) result_count=0 ;;
+  esac
+
+  # 读取现有结果里已有多少小区(判断是否"已有非空数据")
+  prev_count=0
+  if [ -f "$SCAN_RESULT" ]; then
+    prev_count="$(jq -r '.resultCount // 0' "$SCAN_RESULT" 2>/dev/null || echo 0)"
+    case "$prev_count" in
+      ''|*[!0-9]*) prev_count=0 ;;
+    esac
+  fi
+
+  # 关键规则：本次空结果 && 已有非空结果 -> 不覆盖已有数据，只记"本次空扫描"标记(UI 提示已过期)
+  if [ "$result_count" = "0" ] && [ "$prev_count" -gt 0 ]; then
+    jq -n \
+      --arg scannedAt "$finished_at" \
+      --argjson epoch "$now_epoch" \
+      '{scannedAt:$scannedAt,epoch:$epoch,empty:true,freshCellsKept:true}' \
+      > "$SCAN_EMPTY_LAST.tmp" 2>/dev/null
+    if [ -s "$SCAN_EMPTY_LAST.tmp" ]; then
+      mv "$SCAN_EMPTY_LAST.tmp" "$SCAN_EMPTY_LAST" 2>/dev/null
+    else
+      rm -f "$SCAN_EMPTY_LAST.tmp"
+    fi
+    log "cellscan 空结果，保留上一次非空数据 job=$job_id"
+    return 0
+  fi
+
+  # 其余情况(非空 或 本就无历史数据的空结果)：正常覆盖写入
+  tmp_file="$SCAN_RESULT.tmp"
+  jq -n \
+    --arg status "$status" \
+    --arg jobId "$job_id" \
+    --arg startedAt "${SCAN_STARTED_TEXT:-$(date '+%Y-%m-%d %H:%M:%S')}" \
+    --arg finishedAt "$finished_at" \
+    --arg duration "$duration" \
+    --arg resultCount "$result_count" \
+    --arg raw "$raw_text" \
+    --argjson cells "$cells_json" \
+    --argjson epoch "$now_epoch" \
+    '{ok:true,status:$status,jobId:$jobId,startedAt:$startedAt,finishedAt:$finishedAt,duration:($duration|tonumber),resultCount:($resultCount|tonumber),raw:$raw,cells:$cells,parserError:"",timestamp:$finishedAt,epoch:$epoch}' \
+    > "$tmp_file"
+  if [ -s "$tmp_file" ]; then
+    mv "$tmp_file" "$SCAN_RESULT"
+    if [ -n "$SCAN_RESULT_PERSIST" ]; then
+      mkdir -p "$(dirname "$SCAN_RESULT_PERSIST")" 2>/dev/null || true
+      cp "$SCAN_RESULT" "$SCAN_RESULT_PERSIST" 2>/dev/null || true
+    fi
+    # 有有效数据了，清掉"空标记"
+    rm -f "$SCAN_EMPTY_LAST" 2>/dev/null
+  else
+    rm -f "$tmp_file"
+    log "write_scan_result failed status=$status"
+  fi
+}
+
+parse_cell_line() {
+  line="$1"
+  body="${line#+GTCELLSCAN:}"
+  case "$body" in
+    " "*) body="${body# }" ;;
+  esac
+  IFS=, read -r rat mcc mnc freq pci tac cellid rsrp rsrq band srxlev squal <<EOF
+$body
+EOF
+  [ -n "$rat" ] || return 0
+  case "$rat" in
+    4) rat_label="LTE" ;;
+    5) rat_label="NR" ;;
+    *) return 0 ;;
+  esac
+  case "$band" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  case "$mcc" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  case "$mnc" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  for numeric in "$rsrp" "$rsrq" "$srxlev" "$squal"; do
+    is_integer "$numeric" || return 0
+  done
+  freq_num="$(hex_or_dec "$freq")"
+  pci_num="$(hex_or_dec "$pci")"
+  tac_num="$(hex_or_dec "$tac")"
+  cell_num="$(hex_or_dec "$cellid")"
+  jq -n \
+    --arg rat "$rat_label" \
+    --arg mcc "$mcc" \
+    --arg mnc "$mnc" \
+    --arg band "$band" \
+    --arg rsrp "$rsrp" \
+    --arg rsrq "$rsrq" \
+    --arg srxlev "$srxlev" \
+    --arg squal "$squal" \
+    --arg freq "$freq_num" \
+    --arg pci "$pci_num" \
+    --arg tac "$tac_num" \
+    --arg cellId "$cell_num" \
+    '{rat:$rat,mcc:($mcc|tonumber),mnc:($mnc|tonumber),band:$band,pci:($pci|tonumber),arfcn:($freq|tonumber),rsrp:($rsrp|tonumber),rsrq:($rsrq|tonumber),srxlev:($srxlev|tonumber),squal:($squal|tonumber),tac:($tac|tonumber),cellId:$cellId,plmn:""}'
+}
+
+parse_cells() {
+  cells_jsonl="$STATE_DIR/cells.jsonl"
+  : > "$cells_jsonl"
+  while IFS= read -r line; do
+    case "$line" in
+      *"There is no sib1"*|*"There is no SIB1"*) continue ;;
+    esac
+    case "$line" in
+      +GTCELLSCAN:\ 4,*|+GTCELLSCAN:4,*|+GTCELLSCAN:\ 5,*|+GTCELLSCAN:5,*)
+        parse_cell_line "$line" >> "$cells_jsonl"
+        ;;
+    esac
+  done < "$SCAN_RAW"
+  if [ -s "$cells_jsonl" ]; then
+    jq -s '.' "$cells_jsonl"
+  else
+    echo '[]'
+  fi
+}
+
+collect_scan() {
+  job_started_at="$1"
+  attempt_started_at="$2"
+  attempt_timeout="$3"
+  job_deadline=$((job_started_at + SCAN_TIMEOUT))
+  deadline=$((attempt_started_at + attempt_timeout))
+  if [ "$job_deadline" -lt "$deadline" ]; then
+    deadline="$job_deadline"
+  fi
+  last_data_at="$attempt_started_at"
+  last_status_at="$attempt_started_at"
+  saw_cell=0
+  saw_any=0
+  saw_lte_no_sib1=0
+  saw_nr_no_sib1=0
+  printf '%s\n' "--- attempt $CURRENT_ATTEMPT ---" >> "$SCAN_RAW"
+  log "cellscan command_sent job=$JOB_ID attempt=$CURRENT_ATTEMPT port=$PORT_B"
+  printf 'AT+GTCELLSCAN\r' >&6 || return 1
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if IFS= read -r -t 1 line <&6; then
+      clean_line="$(printf '%s' "$line" | tr -d '\r')"
+      printf '%s\n' "$clean_line" >> "$SCAN_RAW"
+      now_epoch="$(date +%s)"
+      elapsed=$((now_epoch - job_started_at))
+      if [ "$elapsed" -lt 0 ]; then elapsed=0; fi
+
+      case "$clean_line" in
+        *ERROR*)
+          write_scan_status "failed" "$JOB_ID" "$job_started_at" "$elapsed" "" "0" "AT+GTCELLSCAN returned ERROR"
+          return 1
+          ;;
+        +GTCELLSCAN:*)
+          if [ "$saw_any" = "0" ]; then
+            saw_any=1
+            log "cellscan urc_received job=$JOB_ID attempt=$CURRENT_ATTEMPT"
+          fi
+          case "$clean_line" in
+            *"There is no sib1"*|*"There is no SIB1"*)
+              case "$clean_line" in
+                +GTCELLSCAN:\ 4,*|+GTCELLSCAN:\ 4,*) saw_lte_no_sib1=1 ;;
+                +GTCELLSCAN:\ 5,*|+GTCELLSCAN:\ 5,*) saw_nr_no_sib1=1 ;;
+              esac
+              ;;
+            *)
+              saw_cell=1
+              last_data_at="$now_epoch"
+              ;;
+          esac
+          ;;
+      esac
+
+      if [ "$saw_cell" = "1" ] && [ $((now_epoch - last_data_at)) -ge "$SCAN_QUIET_SECONDS" ]; then
+        return 0
+      fi
+      if [ "$saw_cell" = "0" ] && [ "$saw_lte_no_sib1" = "1" ] && [ "$saw_nr_no_sib1" = "1" ]; then
+        return 3
+      fi
+      if [ $((now_epoch - last_status_at)) -ge 2 ]; then
+        write_scan_status "running" "$JOB_ID" "$job_started_at" "$elapsed" "" "0" ""
+        last_status_at="$now_epoch"
+      fi
+    fi
+
+    now_epoch="$(date +%s)"
+    if [ "$saw_cell" = "1" ] && [ $((now_epoch - last_data_at)) -ge "$SCAN_QUIET_SECONDS" ]; then
+      return 0
+    fi
+    if [ "$saw_cell" = "0" ] && [ "$saw_lte_no_sib1" = "1" ] && [ "$saw_nr_no_sib1" = "1" ]; then
+      return 3
+    fi
+    elapsed=$((now_epoch - job_started_at))
+    if [ "$elapsed" -lt 0 ]; then elapsed=0; fi
+    if [ $((now_epoch - last_status_at)) -ge 5 ]; then
+      write_scan_status "running" "$JOB_ID" "$job_started_at" "$elapsed" "" "0" ""
+      last_status_at="$now_epoch"
+    fi
+  done
+  if [ "$saw_cell" = "1" ]; then
+    return 0
+  fi
+  return 2
+}
+
+run_cellscan_job() {
+  [ -f "$SCAN_REQUEST" ] || return 0
+  req="$(cat "$SCAN_REQUEST" 2>/dev/null)"
+  JOB_ID="$(printf '%s' "$req" | jq -r '.jobId // "unknown"' 2>/dev/null)"
+  request_timeout="$(printf '%s' "$req" | jq -r '.timeout // 180' 2>/dev/null)"
+  request_attempt_timeout="$(printf '%s' "$req" | jq -r '.attemptTimeout // 90' 2>/dev/null)"
+  request_max_attempts="$(printf '%s' "$req" | jq -r '.maxAttempts // 2' 2>/dev/null)"
+  request_retry_delay="$(printf '%s' "$req" | jq -r '.retryDelay // 5' 2>/dev/null)"
+  request_trigger="$(printf '%s' "$req" | jq -r '.trigger // "manual"' 2>/dev/null)"
+  case "$request_timeout" in
+    ''|*[!0-9]*) request_timeout=180 ;;
+  esac
+  if [ "$request_timeout" -lt 1 ]; then
+    request_timeout=180
+  fi
+  case "$request_attempt_timeout" in
+    ''|*[!0-9]*) request_attempt_timeout=90 ;;
+  esac
+  if [ "$request_attempt_timeout" -lt 1 ] || [ "$request_attempt_timeout" -gt "$request_timeout" ]; then
+    request_attempt_timeout="$request_timeout"
+  fi
+  case "$request_max_attempts" in
+    ''|*[!0-9]*) request_max_attempts=2 ;;
+  esac
+  if [ "$request_max_attempts" -lt 1 ]; then
+    request_max_attempts=1
+  fi
+  if [ "$request_max_attempts" -gt 5 ]; then
+    request_max_attempts=5
+  fi
+  case "$request_retry_delay" in
+    ''|*[!0-9]*) request_retry_delay=5 ;;
+  esac
+  if [ "$request_retry_delay" -lt 1 ]; then
+    request_retry_delay=5
+  fi
+  case "$request_trigger" in
+    auto|manual) ;;
+    *) request_trigger="manual" ;;
+  esac
+  SCAN_TIMEOUT="$request_timeout"
+  SCAN_ATTEMPT_TIMEOUT="$request_attempt_timeout"
+  SCAN_MAX_ATTEMPTS="$request_max_attempts"
+  SCAN_RETRY_DELAY="$request_retry_delay"
+  SCAN_TRIGGER="$request_trigger"
+  CURRENT_MAX_ATTEMPTS="$SCAN_MAX_ATTEMPTS"
+  CURRENT_ATTEMPT=1
+  started_epoch="$(date +%s)"
+  started_at="$(mono)"
+  SCAN_STARTED_TEXT="$(date '+%Y-%m-%d %H:%M:%S')"
+  log "cellscan start job=$JOB_ID trigger=$SCAN_TRIGGER port=$PORT_B timeout=$SCAN_TIMEOUT attempts=$SCAN_MAX_ATTEMPTS"
+
+  write_port_b "busy" "GTCELLSCAN" "$JOB_ID"
+  : > "$SCAN_RAW"
+  write_scan_status "starting" "$JOB_ID" "$started_at" "0" "" "0" ""
+  write_scan_status "running" "$JOB_ID" "$started_at" "0" "" "0" ""
+
+  # 扫描放后台执行, 由 watchdog 守护: 超时(SCAN_TIMEOUT)未返回就强杀, 确保不阻塞后续扫描
+  /usr/sbin/fm170_scan_fd "$SCAN_RAW" "$SCAN_TIMEOUT" "$SCAN_ATTEMPT_TIMEOUT" \
+    "$SCAN_MAX_ATTEMPTS" "$SCAN_RETRY_DELAY" "$SCAN_QUIET_SECONDS" "$PORT_B" &
+  scan_pid=$!
+  scan_rc=99
+  mono_job_start="$(mono)"
+  scan_wd_deadline=$((mono_job_start + SCAN_TIMEOUT))
+  killed=0
+  while :; do
+    if ! kill -0 "$scan_pid" 2>/dev/null; then
+      wait "$scan_pid"; scan_rc=$?
+      break
+    fi
+    mono_now="$(mono)"
+    if [ "$mono_now" -ge "$scan_wd_deadline" ]; then
+      kill "$scan_pid" 2>/dev/null
+      wait "$scan_pid" 2>/dev/null
+      killed=1
+      scan_rc=2
+      log "cellscan watchdog: killed stalled session after ${SCAN_TIMEOUT}s job=$JOB_ID pid=$scan_pid"
+      break
+    fi
+    sleep 1
+  done
+  CURRENT_ATTEMPT="$(grep -c '^--- attempt ' "$SCAN_RAW" 2>/dev/null || echo 0)"
+  case "$CURRENT_ATTEMPT" in
+    ''|*[!0-9]*) CURRENT_ATTEMPT=0 ;;
+  esac
+  finished_epoch="$(date +%s)"
+  finished_at="$(mono)"
+  finished_text="$(date '+%Y-%m-%d %H:%M:%S')"
+  duration=$((finished_at - started_at))
+  if [ "$duration" -lt 0 ]; then duration=0; fi
+
+  case "$scan_rc" in
+    0)
+      cells="$(parse_cells)"
+      result_count="$(printf '%s' "$cells" | jq 'length' 2>/dev/null || echo 0)"
+      case "$result_count" in
+        ''|*[!0-9]*) result_count=0 ;;
+      esac
+      parser_error=""
+      expected_lines="$(grep -c '^+GTCELLSCAN: [45],[0-9]' "$SCAN_RAW" 2>/dev/null || echo 0)"
+      actual_lines="$result_count"
+      case "$expected_lines" in
+        ''|*[!0-9]*) expected_lines=0 ;;
+      esac
+      case "$actual_lines" in
+        ''|*[!0-9]*) actual_lines=0 ;;
+      esac
+      if [ "$expected_lines" -gt 0 ] && [ "$actual_lines" -lt "$expected_lines" ]; then
+        parser_error="parsed $actual_lines of $expected_lines GTCELLSCAN lines"
+      fi
+      raw_text="$(cat "$SCAN_RAW" 2>/dev/null || true)"
+      write_scan_result "completed" "$JOB_ID" "$SCAN_STARTED_TEXT" "$finished_text" "$duration" "$result_count" "$raw_text" "$cells"
+      write_scan_status "completed" "$JOB_ID" "$started_at" "$duration" "$finished_text" "$result_count" "$parser_error"
+      log "cellscan completed job=$JOB_ID cells=$result_count parsed=$result_count duration=$duration"
+      ;;
+    1)
+      raw_text="$(cat "$SCAN_RAW" 2>/dev/null || true)"
+      write_scan_result "completed" "$JOB_ID" "$SCAN_STARTED_TEXT" "$finished_text" "$duration" "0" "$raw_text" "[]"
+      write_scan_status "failed" "$JOB_ID" "$started_at" "$duration" "$finished_text" "0" "AT+GTCELLSCAN returned ERROR (attempt $CURRENT_ATTEMPT)"
+      log "cellscan failed job=$JOB_ID"
+      ;;
+    2)
+      raw_text="$(cat "$SCAN_RAW" 2>/dev/null || true)"
+      write_scan_result "completed" "$JOB_ID" "$SCAN_STARTED_TEXT" "$finished_text" "$duration" "0" "$raw_text" "[]"
+      write_scan_status "timeout" "$JOB_ID" "$started_at" "$duration" "$finished_text" "0" "GTCELLSCAN did not return cells within ${SCAN_TIMEOUT}s (${SCAN_MAX_ATTEMPTS} attempts)"
+      cp "$SCAN_RAW" "$SCAN_PARTIAL" 2>/dev/null || true
+      log "cellscan timeout job=$JOB_ID duration=$duration"
+      ;;
+    3)
+      raw_text="$(cat "$SCAN_RAW" 2>/dev/null || true)"
+      write_scan_result "completed" "$JOB_ID" "$SCAN_STARTED_TEXT" "$finished_text" "$duration" "0" "$raw_text" "[]"
+      write_scan_status "completed" "$JOB_ID" "$started_at" "$duration" "$finished_text" "0" ""
+      log "cellscan completed without cells job=$JOB_ID duration=$duration attempts=$SCAN_MAX_ATTEMPTS"
+      ;;
+  esac
+  write_port_b "ready" ""
+  rm -f "$SCAN_REQUEST"
+  return 0
+}
+
+worker_b() {
+  echo "$$" > "$B_PID_FILE"
+  last_sms_epoch=0
+  sms_interval="${SMS_INTERVAL:-45}"
+  while :; do
+    if [ -f "$SCAN_REQUEST" ]; then
+      run_cellscan_job
+      continue
+    fi
+    now_epoch="$(date +%s)"
+    if [ "$now_epoch" -lt "$last_sms_epoch" ]; then
+      last_sms_epoch=0
+    fi
+    if [ $((now_epoch - last_sms_epoch)) -ge "$sms_interval" ]; then
+      # 独立、低频、低优先级、可失败的 SMS 检查（空闲时且扫描未在进行）
+      if /usr/sbin/fm170_sms_check.sh poll >/dev/null 2>&1; then
+        last_sms_epoch="$(date +%s)"
+      else
+        last_sms_epoch=$((now_epoch + 15))
+      fi
+    fi
+    write_port_b "ready" ""
+    sleep 1
+  done
+}
+
+start_worker() {
+  worker_name="$1"
+  case "$worker_name" in
+    a)
+      /bin/sh /usr/sbin/fm170_scheduler --worker-a >> "$LOG_FILE.worker.$worker_name" 2>&1 &
+      ;;
+    b)
+      /bin/sh /usr/sbin/fm170_scheduler --worker-b >> "$LOG_FILE.worker.$worker_name" 2>&1 &
+      ;;
+  esac
+  worker_pid=$!
+  case "$worker_name" in
+    a) printf '%s\n' "$worker_pid" > "$A_PID_FILE" ;;
+    b) printf '%s\n' "$worker_pid" > "$B_PID_FILE" ;;
+  esac
+  log "worker $worker_name started pid=$worker_pid"
+}
+
+worker_alive() {
+  pid_file="$1"
+  [ -f "$pid_file" ] || return 1
+  pid="$(cat "$pid_file" 2>/dev/null || echo 0)"
+  case "$pid" in
+    ''|*[!0-9]*) pid=0 ;;
+  esac
+  [ "$pid" -gt 0 ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+stop_workers() {
+  for pid_file in "$A_PID_FILE" "$B_PID_FILE"; do
+    if [ -f "$pid_file" ]; then
+      pid="$(cat "$pid_file" 2>/dev/null || echo 0)"
+      case "$pid" in
+        ''|*[!0-9]*) pid=0 ;;
+      esac
+      if [ "$pid" -gt 0 ]; then
+        kill "$pid" 2>/dev/null
+      fi
+      rm -f "$pid_file"
+    fi
+  done
+}
+
+master() {
+  mkdir -p "$STATE_DIR" "$CTRL_QUEUE"
+  # 规范化陈旧的扫描状态：避免上一轮扫描因时钟/进程异常残留成长期 running 或超大 elapsed
+  if [ -f "$SCAN_STATUS" ]; then
+    st="$(jq -r '.status // ""' "$SCAN_STATUS" 2>/dev/null || echo '')"
+    started_epoch="$(jq -r '.epoch // 0' "$SCAN_STATUS" 2>/dev/null || echo 0)"
+    case "$started_epoch" in ''|*[!0-9]*) started_epoch=0 ;; esac
+    now_e="$(date +%s)"
+    if { [ "$st" = "running" ] || [ "$st" = "starting" ]; } && [ "$started_epoch" -gt 0 ] && [ $((now_e - started_epoch)) -gt 190 ]; then
+      write_scan_status "timeout" "$(jq -r '.jobId//""' "$SCAN_STATUS" 2>/dev/null||echo '')" "$started_epoch" "" "$(date '+%Y-%m-%d %H:%M:%S')" "0" "stale state, rescheduled timeout"
+      # 陈旧扫描的 request 一并清理，避免调度器重启后 worker_b 把一条过期的手动请求当成新扫描重跑（仅允许手动触发）
+      rm -f "$SCAN_REQUEST"
+      log "normalized stale scan status (was $st) and cleared stale scan request"
+    elif [ "$st" = "completed" ] || [ "$st" = "timeout" ] || [ "$st" = "failed" ]; then
+      # 终结态：把可能超大的 elapsed 修正
+      jq --argjson cap "${SCAN_TIMEOUT:-180}" 'if (.elapsed//0) > ($cap+30) then .elapsed=($cap+30) else . end' "$SCAN_STATUS" > "$SCAN_STATUS.tmp" 2>/dev/null && mv "$SCAN_STATUS.tmp" "$SCAN_STATUS"
+    fi
+  fi
+  if [ -f "$SCAN_RESULT_PERSIST" ]; then
+    cp "$SCAN_RESULT_PERSIST" "$SCAN_RESULT" 2>/dev/null || true
+    log "restored persistent cell scan result from $SCAN_RESULT_PERSIST"
+  fi
+  exec 9>"$MASTER_LOCK"
+  if ! flock -n 9; then
+    exit 0
+  fi
+  printf '%s\n' "$$" > "$PID_FILE"
+  stop_workers
+  write_ports "ready" "" "" "ready" "" ""
+  start_worker a
+  start_worker b
+  log "fm170_scheduler start pid=$$ portA=$PORT_A portB=$PORT_B"
+  trap 'stop_workers; exit 0' TERM INT HUP
+
+  while :; do
+    if ! worker_alive "$A_PID_FILE"; then
+      log "worker a missing, restarting"
+      start_worker a
+    fi
+    if ! worker_alive "$B_PID_FILE"; then
+      log "worker b missing, restarting"
+      start_worker b
+    fi
+    sleep 3
+  done
+}
+
+case "$1" in
+  --worker-a)
+    worker_a
+    ;;
+  --worker-b)
+    worker_b
+    ;;
+  *)
+    master
+    ;;
+esac

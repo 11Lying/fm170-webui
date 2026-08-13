@@ -1,0 +1,139 @@
+#!/bin/sh
+
+# GTCELLSCAN direct serial reader used by fm170_scheduler.
+# It keeps one shell fd open and repeatedly uses IFS= read -r -t 1 so the
+# asynchronous +GTCELLSCAN URCs are captured after the immediate OK.
+
+SCAN_RAW="${1:-/tmp/fm170/cellscan_raw.txt}"
+SCAN_TIMEOUT="${2:-185}"
+SCAN_ATTEMPT_TIMEOUT="${3:-180}"
+SCAN_MAX_ATTEMPTS="${4:-2}"
+SCAN_RETRY_DELAY="${5:-5}"
+SCAN_QUIET_SECONDS="${6:-20}"
+PORT_B="${7:-/dev/ttyUSB1}"
+
+# Do not inherit scheduler lock/control descriptors into the serial reader.
+exec 9<&- 2>/dev/null
+
+# 单调时钟: 用 /proc/uptime 秒数, 不受 NTP/date 跳变影响。
+# GTCELLSCAN 的 deadline/elapsed 必须用它, 否则 NTP 校时(设备无RTC)会让扫描计时错乱/卡死。
+mono() {
+  awk '{print int($1)}' /proc/uptime 2>/dev/null || date +%s
+}
+
+case "$SCAN_TIMEOUT" in
+  ''|*[!0-9]*) SCAN_TIMEOUT=185 ;;
+esac
+if [ "$SCAN_TIMEOUT" -lt 1 ]; then
+  SCAN_TIMEOUT=185
+fi
+case "$SCAN_ATTEMPT_TIMEOUT" in
+  ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=180 ;;
+esac
+if [ "$SCAN_ATTEMPT_TIMEOUT" -lt 1 ] || [ "$SCAN_ATTEMPT_TIMEOUT" -gt "$SCAN_TIMEOUT" ]; then
+  SCAN_ATTEMPT_TIMEOUT="$SCAN_TIMEOUT"
+fi
+case "$SCAN_MAX_ATTEMPTS" in
+  ''|*[!0-9]*) SCAN_MAX_ATTEMPTS=2 ;;
+esac
+if [ "$SCAN_MAX_ATTEMPTS" -lt 1 ]; then
+  SCAN_MAX_ATTEMPTS=1
+fi
+if [ "$SCAN_MAX_ATTEMPTS" -gt 5 ]; then
+  SCAN_MAX_ATTEMPTS=5
+fi
+case "$SCAN_RETRY_DELAY" in
+  ''|*[!0-9]*) SCAN_RETRY_DELAY=5 ;;
+esac
+if [ "$SCAN_RETRY_DELAY" -lt 1 ]; then
+  SCAN_RETRY_DELAY=5
+fi
+case "$SCAN_QUIET_SECONDS" in
+  ''|*[!0-9]*) SCAN_QUIET_SECONDS=20 ;;
+esac
+
+: > "$SCAN_RAW" || exit 1
+exec 3<>"$PORT_B" || exit 1
+if ! stty -F "$PORT_B" 115200 raw -echo <&3 >/dev/null 2>&1; then
+  stty raw -echo <&3 >/dev/null 2>&1
+fi
+sleep 2
+
+job_started_at="$(mono)"
+job_deadline=$((job_started_at + SCAN_TIMEOUT))
+attempt=1
+saw_lte_no_sib1=0
+saw_nr_no_sib1=0
+
+while [ "$attempt" -le "$SCAN_MAX_ATTEMPTS" ]; do
+  if [ "$attempt" -gt 1 ]; then
+    now_epoch="$(mono)"
+    if [ "$now_epoch" -ge "$job_deadline" ]; then
+      exit 2
+    fi
+    remaining=$((job_deadline - now_epoch))
+    if [ "$remaining" -lt "$SCAN_RETRY_DELAY" ]; then
+      sleep "$remaining"
+    else
+      sleep "$SCAN_RETRY_DELAY"
+    fi
+  fi
+  printf '%s\n' "--- attempt $attempt ---" >> "$SCAN_RAW"
+  attempt_started_at="$(mono)"
+  attempt_deadline=$((attempt_started_at + SCAN_ATTEMPT_TIMEOUT))
+  if [ "$job_deadline" -lt "$attempt_deadline" ]; then
+    attempt_deadline="$job_deadline"
+  fi
+
+  printf 'AT+GTCELLSCAN\r' >&3 || exit 1
+  saw_cell=0
+  last_data_at="$attempt_started_at"
+
+  while [ "$(mono)" -lt "$attempt_deadline" ]; do
+    if IFS= read -r -t 1 line <&3; then
+      clean_line="$(printf '%s' "$line" | tr -d '\r')"
+      printf '%s\n' "$clean_line" >> "$SCAN_RAW"
+      case "$clean_line" in
+        *ERROR*)
+          exit 1
+          ;;
+        +GTCELLSCAN:*)
+          body="${clean_line#+GTCELLSCAN:}"
+          case "$body" in
+            " "*) body="${body# }" ;;
+          esac
+          case "$body" in
+            *"There is no sib1"*|*"There is no SIB1"*)
+              case "$body" in
+                4,*) saw_lte_no_sib1=1 ;;
+                5,*) saw_nr_no_sib1=1 ;;
+              esac
+              ;;
+            *)
+              saw_cell=1
+              last_data_at="$(mono)"
+              ;;
+          esac
+          ;;
+      esac
+      now_epoch="$(mono)"
+      if [ "$saw_cell" = "1" ] && [ $((now_epoch - last_data_at)) -ge "$SCAN_QUIET_SECONDS" ]; then
+        exit 0
+      fi
+    fi
+    now_epoch="$(mono)"
+    if [ "$saw_cell" = "1" ] && [ $((now_epoch - last_data_at)) -ge "$SCAN_QUIET_SECONDS" ]; then
+      exit 0
+    fi
+  done
+
+  if [ "$saw_cell" = "1" ]; then
+    exit 0
+  fi
+  attempt=$((attempt + 1))
+done
+
+if [ "$saw_lte_no_sib1" = "1" ] && [ "$saw_nr_no_sib1" = "1" ]; then
+  exit 3
+fi
+exit 2

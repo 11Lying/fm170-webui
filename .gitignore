@@ -1,0 +1,11 @@
+# 敏感 / 运行时文件，绝不入库
+*.bak
+*.bak.*
+*.log
+*.pid
+*.lock
+.orig
+.ds_store
+*.core
+/tmp/
+*\.trim\.
