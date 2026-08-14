@@ -9,7 +9,7 @@ SCAN_TIMEOUT="${2:-185}"
 SCAN_ATTEMPT_TIMEOUT="${3:-180}"
 SCAN_MAX_ATTEMPTS="${4:-2}"
 SCAN_RETRY_DELAY="${5:-5}"
-SCAN_QUIET_SECONDS="${6:-20}"
+SCAN_QUIET_SECONDS="${6:-10}"
 PORT_B="${7:-/dev/ttyUSB1}"
 
 # Do not inherit scheduler lock/control descriptors into the serial reader.
@@ -49,7 +49,7 @@ if [ "$SCAN_RETRY_DELAY" -lt 1 ]; then
   SCAN_RETRY_DELAY=5
 fi
 case "$SCAN_QUIET_SECONDS" in
-  ''|*[!0-9]*) SCAN_QUIET_SECONDS=20 ;;
+  ''|*[!0-9]*) SCAN_QUIET_SECONDS=10 ;;
 esac
 
 : > "$SCAN_RAW" || exit 1

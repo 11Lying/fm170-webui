@@ -33,13 +33,15 @@ master (fm170_scheduler)
 
 | 文件 | 作用 |
 |---|---|
-| `fm170_scheduler` | 主调度器（master + worker-a + worker-b），AT 频率分级、仅手动扫描 |
+| `fm170_scheduler` | 主调度器（master + worker-a + worker-b），AT 频率分级、仅手动扫描、**自动端口探测** |
 | `fm170_at.sh` | 统一串口访问（socat + flock） |
-| `fm170_scan_fd` | GTCELLSCAN 串口读取器（保持原样未改） |
-| `fm170_sms_check.sh` | 独立 SMS 轮询（Port B） |
+| `fm170_scan_fd` | GTCELLSCAN 串口读取器 |
+| `fm170_sms_check.sh` | SMS 检查脚本（**已改为手动刷新**） |
+| `fm170_log_trim.sh` | /tmp/fm170 日志体积控制 |
 | `fm170_api.cgi` | 状态/扫描/SMS/端口 API |
 | `fm170_control.cgi` | 控制链路（网络模式/锁频/锁小区/PLMN/SMS AT） |
 | `fm170_dial.cgi` | 独立 QMI 拨号控制器（支持可选手动 APN） |
+| `dial.html` | WebUI 独立拨号页面（含 APN 输入框） |
 | `fm170_scan.sh` | 命令行扫描请求入口 |
 | `index.html` | WebUI 入口 |
 | `index-DLZvxu_t.js` | WebUI 前端 bundle（状态/扫描/SMS 页面） |
@@ -54,8 +56,10 @@ master (fm170_scheduler)
   - 启动一次：`ATE0 / CGMM / CGMR / GTACT=? / CEMODE / GTROAMCFG / GTDUALSIM`
 - 无周期性裸 `AT` 探活
 - 邻区扫描仅手动触发（无 boot/periodic/stale 自动扫描）
+- **自动端口探测**：调度器启动时对 /dev/ttyUSB* 逐个发 AT，自动挑选两个可用串口作为 A(状态/控制)/B(扫描/短信)，抗 USB 重枚举导致的串口漂移
+- **短信手动刷新**：不再自动 poll，用户在短信页点"刷新短信"才更新
 - status.json schema 兼容（19 个 raw 字段全保留）
-- 拨号页支持可选 APN（默认 auto，可手填固定 APN）
+- 拨号页 `dial.html` 支持可选 APN（默认 auto，可手填固定 APN）
 
 ## 部署
 
@@ -71,8 +75,10 @@ master (fm170_scheduler)
 /www/cgi-bin/fm170_dial.cgi
 /www/cgi-bin/fm170_scan.sh
 /www/fm170/index.html
+/www/fm170/dial.html
 /www/fm170/assets/index-DLZvxu_t.js
 /www/fm170/fm170-ux.js
+/usr/sbin/fm170_log_trim.sh
 ```
 
 调度器由 procd 管理（`/etc/init.d/fm170_scheduler`）。

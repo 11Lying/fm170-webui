@@ -12,6 +12,50 @@
 PORT_A="${FM170_PORT_A:-/dev/ttyUSB2}"
 PORT_B="${FM170_PORT_B:-/dev/ttyUSB1}"
 
+# ---- 端口自动探测：调度器启动时对 /dev/ttyUSB* 逐个发 AT，挑两个可用的作为 PortA/PortB ----
+# 两个串口底层同功，只是人为分工 A(状态/控制) 与 B(扫描/短信)。
+# 若用户显式指定 FM170_PORT_A/B 且对应串口存在，则优先用户设定，不覆盖。
+# 探测到 >=2 个有效口时，覆盖 PORT_A/PORT_B；否则保留默认并记日志。
+probe_port_ok() {
+  port="$1"
+  [ -e "$port" ] || return 1
+  # 用 AT+CGMM? 作探活（裸 AT 对部分串口不回应，导致漏选有效口）
+  resp="$(/usr/sbin/fm170_at.sh "$port" 2 "AT+CGMM?" 2>/dev/null)"
+  case "$resp" in
+    *OK*) return 0 ;;
+  esac
+  return 1
+}
+
+detect_ports() {
+  # 用户显式指定且串口存在 -> 直接用，跳过探测（避免覆盖用户的强制映射）
+  if [ -n "$FM170_PORT_A" ] && [ -e "$FM170_PORT_A" ] && [ -n "$FM170_PORT_B" ] && [ -e "$FM170_PORT_B" ]; then
+    return 0
+  fi
+  build=""
+  candidates=""
+  for d in /dev/ttyUSB*; do
+    [ -e "$d" ] || continue
+    if probe_port_ok "$d"; then
+      candidates="$candidates $d"
+    fi
+  done
+  count=0
+  for c in $candidates; do
+    count=$((count + 1))
+    case "$count" in
+      1) PORT_A="$c" ;;
+      2) PORT_B="$c" ;;
+    esac
+    [ "$count" -ge 2 ] && break
+  done
+  if [ "$count" -ge 2 ]; then
+    log "ports autoprobed A=$PORT_A B=$PORT_B (candidates:$candidates)"
+  else
+    log "ports autoprobe insufficient (found $count), keep A=$PORT_A B=$PORT_B"
+  fi
+}
+
 STATE_DIR="${FM170_STATE_DIR:-/tmp/fm170}"
 STATUS_FILE="$STATE_DIR/status.json"
 ERROR_FILE="$STATE_DIR/status_error.json"
@@ -38,7 +82,7 @@ SCAN_TIMEOUT="${FM170_SCAN_TIMEOUT:-185}"
 SCAN_ATTEMPT_TIMEOUT="${FM170_SCAN_ATTEMPT_TIMEOUT:-180}"
 SCAN_MAX_ATTEMPTS="${FM170_SCAN_MAX_ATTEMPTS:-3}"
 SCAN_RETRY_DELAY="${FM170_SCAN_RETRY_DELAY:-5}"
-SCAN_QUIET_SECONDS="${FM170_SCAN_QUIET_SECONDS:-20}"
+SCAN_QUIET_SECONDS="${FM170_SCAN_QUIET_SECONDS:-10}"
 CONTROL_TIMEOUT="${FM170_CONTROL_TIMEOUT:-8}"
 SCAN_STARTED_TEXT=""
 SCAN_TRIGGER="manual"
@@ -82,7 +126,7 @@ if [ "$SCAN_RETRY_DELAY" -lt 1 ]; then
   SCAN_RETRY_DELAY=5
 fi
 case "$SCAN_QUIET_SECONDS" in
-  ''|*[!0-9]*) SCAN_QUIET_SECONDS=20 ;;
+  ''|*[!0-9]*) SCAN_QUIET_SECONDS=10 ;;
 esac
 
 log() {
@@ -948,24 +992,12 @@ run_cellscan_job() {
 
 worker_b() {
   echo "$$" > "$B_PID_FILE"
-  last_sms_epoch=0
-  sms_interval="${SMS_INTERVAL:-45}"
+  # SMS 已改为手动刷新：不再在 worker_b 里自动 poll。
+  # 用户手动刷新短信走接口 /cgi-bin/fm170_api.cgi?action=sms_refresh（调用 fm170_sms_check.sh poll）。
   while :; do
     if [ -f "$SCAN_REQUEST" ]; then
       run_cellscan_job
       continue
-    fi
-    now_epoch="$(date +%s)"
-    if [ "$now_epoch" -lt "$last_sms_epoch" ]; then
-      last_sms_epoch=0
-    fi
-    if [ $((now_epoch - last_sms_epoch)) -ge "$sms_interval" ]; then
-      # 独立、低频、低优先级、可失败的 SMS 检查（空闲时且扫描未在进行）
-      if /usr/sbin/fm170_sms_check.sh poll >/dev/null 2>&1; then
-        last_sms_epoch="$(date +%s)"
-      else
-        last_sms_epoch=$((now_epoch + 15))
-      fi
     fi
     write_port_b "ready" ""
     sleep 1
@@ -976,10 +1008,10 @@ start_worker() {
   worker_name="$1"
   case "$worker_name" in
     a)
-      /bin/sh /usr/sbin/fm170_scheduler --worker-a >> "$LOG_FILE.worker.$worker_name" 2>&1 &
+      FM170_PORT_A="$PORT_A" FM170_PORT_B="$PORT_B" /bin/sh /usr/sbin/fm170_scheduler --worker-a >> "$LOG_FILE.worker.$worker_name" 2>&1 &
       ;;
     b)
-      /bin/sh /usr/sbin/fm170_scheduler --worker-b >> "$LOG_FILE.worker.$worker_name" 2>&1 &
+      FM170_PORT_A="$PORT_A" FM170_PORT_B="$PORT_B" /bin/sh /usr/sbin/fm170_scheduler --worker-b >> "$LOG_FILE.worker.$worker_name" 2>&1 &
       ;;
   esac
   worker_pid=$!
@@ -1044,6 +1076,8 @@ master() {
   fi
   printf '%s\n' "$$" > "$PID_FILE"
   stop_workers
+  # 自动探测串联口：确保 PortA/PortB 映射到两个可用串口（抗 USB 重枚举漂移）
+  detect_ports
   write_ports "ready" "" "" "ready" "" ""
   start_worker a
   start_worker b
