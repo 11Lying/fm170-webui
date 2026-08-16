@@ -78,8 +78,8 @@ A_PID_FILE="/var/run/fm170_scheduler_a.pid"
 B_PID_FILE="/var/run/fm170_scheduler_b.pid"
 
 STATUS_INTERVAL="${FM170_STATUS_INTERVAL:-3}"
-SCAN_TIMEOUT="${FM170_SCAN_TIMEOUT:-185}"
-SCAN_ATTEMPT_TIMEOUT="${FM170_SCAN_ATTEMPT_TIMEOUT:-180}"
+SCAN_TIMEOUT="${FM170_SCAN_TIMEOUT:-90}"
+SCAN_ATTEMPT_TIMEOUT="${FM170_SCAN_ATTEMPT_TIMEOUT:-90}"
 SCAN_MAX_ATTEMPTS="${FM170_SCAN_MAX_ATTEMPTS:-3}"
 SCAN_RETRY_DELAY="${FM170_SCAN_RETRY_DELAY:-5}"
 SCAN_QUIET_SECONDS="${FM170_SCAN_QUIET_SECONDS:-10}"
@@ -99,13 +99,13 @@ if [ "$STATUS_INTERVAL" -lt 1 ]; then
   STATUS_INTERVAL=3
 fi
 case "$SCAN_TIMEOUT" in
-  ''|*[!0-9]*) SCAN_TIMEOUT=185 ;;
+  ''|*[!0-9]*) SCAN_TIMEOUT=90 ;;
 esac
 if [ "$SCAN_TIMEOUT" -lt 1 ]; then
-  SCAN_TIMEOUT=185
+  SCAN_TIMEOUT=90
 fi
   case "$SCAN_ATTEMPT_TIMEOUT" in
-    ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=180 ;;
+    ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=90 ;;
 esac
 if [ "$SCAN_ATTEMPT_TIMEOUT" -lt 1 ] || [ "$SCAN_ATTEMPT_TIMEOUT" -gt "$SCAN_TIMEOUT" ]; then
   SCAN_ATTEMPT_TIMEOUT="$SCAN_TIMEOUT"
@@ -591,7 +591,7 @@ write_scan_status() {
   fi
   # 封顶 elapsed：避免时钟异常/进程挂起导致写入超大值(如 28690s)
   case "$SCAN_TIMEOUT" in
-    ''|*[!0-9]*) SCAN_TIMEOUT=185 ;;
+    ''|*[!0-9]*) SCAN_TIMEOUT=90 ;;
   esac
   max_elapsed=$((SCAN_TIMEOUT + 30))
   if [ "$elapsed" -gt "$max_elapsed" ]; then

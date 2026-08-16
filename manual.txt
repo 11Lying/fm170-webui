@@ -1,0 +1,128 @@
+FM170-EAU WebUI 调试手册
+========================
+
+访问
+----
+WebUI: http://ROUTER_IP/fm170/
+登录用户: root
+登录密码: 路由器 root 密码，当前测试环境为 zhz12138
+控制操作需要在页面里登录 LuCI/ubus 控制会话
+
+串口分工
+--------
+/dev/ttyUSB1 自动口:
+  fm170_statusd 独占，负责状态轮询和 AT+GTCELLSCAN 邻区扫描。
+/dev/ttyUSB2 控制口:
+  fm170_control.cgi 独占，负责锁小区、解锁、查询、网络模式、频段、重启等用户命令。
+
+重要:
+  邻区扫描只发送 AT+GTCELLSCAN，不发送 AT+GTACT，不切换网络模式。
+  扫描过程中不操作 wwan0，不应导致拨号掉线。
+
+自动轮询
+--------
+自动口状态查询: 默认每 3 秒一次。
+前端状态/扫描状态轮询: 每 5 秒一次。
+自动邻区扫描: 默认每 10 分钟一次。
+扫描进行时: 状态接口返回上一份真实缓存，同时标记 scanning=true。
+
+页面说明
+--------
+总览: 信号、注册状态、IP、运营商、更新时间。
+载波聚合: AT+GTCAINFO / AT+GTCCINFO 相关展示。
+服务小区: 当前 LTE/NR 小区和信号参数。
+邻区: LTE/NR 邻区列表、自动扫描开关、手动扫描、原始返回。
+设置: 端口信息、频段、网络模式、控制会话。
+
+前端页面使用 Mock 数据时不会访问真机；切到 Live 后才会走下面这些接口。
+
+常用 API
+--------
+状态接口（无需控制会话）:
+  /cgi-bin/fm170_api.cgi?action=status
+
+扫描状态接口:
+  /cgi-bin/fm170_api.cgi?action=scan_status
+
+自动扫描开关:
+  读取:
+  /cgi-bin/fm170_api.cgi?action=autoscan
+  设置:
+  /cgi-bin/fm170_api.cgi?action=autoscan&enabled=1
+  /cgi-bin/fm170_api.cgi?action=autoscan&enabled=0
+
+控制会话:
+  /cgi-bin/fm170_control.cgi?action=login&username=root&password=xxx
+  /cgi-bin/fm170_control.cgi?action=session_check&sid=xxx
+  /cgi-bin/fm170_control.cgi?action=logout&sid=xxx
+
+只读查询（需要 sid）:
+  /cgi-bin/fm170_control.cgi?action=query&query=celllock&sid=xxx
+  /cgi-bin/fm170_control.cgi?action=query&query=gtact&sid=xxx
+  /cgi-bin/fm170_control.cgi?action=query&query=gtccinfo&sid=xxx
+  /cgi-bin/fm170_control.cgi?action=query&query=gtca&sid=xxx
+  /cgi-bin/fm170_control.cgi?action=query&query=cesq&sid=xxx
+
+端口状态:
+  /cgi-bin/fm170_control.cgi?action=port_status
+
+写操作（会影响网络，调试时谨慎使用）:
+  /cgi-bin/fm170_control.cgi?action=cell_unlock&sid=xxx
+  /cgi-bin/fm170_control.cgi?action=network_mode&mode=14&sid=xxx
+  /cgi-bin/fm170_control.cgi?action=band_lock&bands=5078&sid=xxx
+  /cgi-bin/fm170_control.cgi?action=restart&confirm=1&sid=xxx
+
+常用文件
+--------
+守护进程:
+  /usr/sbin/fm170_statusd
+  /etc/init.d/fm170_statusd
+
+CGI:
+  /www/cgi-bin/fm170_api.cgi
+  /www/cgi-bin/fm170_control.cgi
+  /www/cgi-bin/fm170_scan.sh
+
+状态和扫描缓存:
+  /tmp/fm170_status.json
+  /tmp/fm170_status_error.json
+  /tmp/fm170_scan_status
+  /tmp/fm170_scan_result.txt
+  /tmp/fm170_scan_request
+  /tmp/fm170_auto_scan
+
+日志:
+  /tmp/fm170_statusd.log
+  /tmp/fm170_scan.log
+
+常用排查
+--------
+查看守护进程是否运行:
+  ps | grep fm170_statusd
+
+查看状态缓存:
+  cat /tmp/fm170_status.json | jq .
+
+查看扫描状态和原始返回:
+  cat /tmp/fm170_scan_status | jq .
+  cat /tmp/fm170_scan_result.txt
+
+查看日志:
+  tail -f /tmp/fm170_statusd.log
+  tail -f /tmp/fm170_scan.log
+
+重启守护进程:
+  /etc/init.d/fm170_statusd restart
+
+查看网络是否正常:
+  ip -4 addr show dev wwan0
+  ip -4 route show
+
+手动提交一次邻区扫描:
+  /www/cgi-bin/fm170_scan.sh nr
+
+安全提示
+--------
+调试时优先使用只读查询。
+AT+GTACT、频段锁定、PLMN 锁定、重启等命令可能立即影响上网，请先确认用户确实需要操作。
+锁小区命令在真实模块上可能持久生效，未明确要求时不要反复测试。

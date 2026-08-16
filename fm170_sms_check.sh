@@ -91,44 +91,40 @@ sms_status_of() {
 
 poll() {
   scan_gate || return 1
-  at "AT+CMGF=1"         # 文本模式
   : > "$SMS_RAW"
   TMPF="$STATE/sms_msgs.$$"
-  msgs="["; sep=""
-  # 用 UCS2 读取，保证中文短信正文以 UCS2 十六进制返回，再解码为可读中文。
-  at 'AT+CSCS="UCS2"'
-  # 短信实际可落在 SM(SIM) 或 ME(模块)。两种都读并合并，确保任何存储进来的短信都能在 WebUI 显示。
-  # 每个存储用独立局部变量捕获，避免共用全局 $RX 造成跨存储串扰/重复。
-  for STORAGE in ME SM; do
-    at "AT+CPMS=\"$STORAGE\""            # 切到该存储
-    RAW_ONE="$(/usr/sbin/fm170_at.sh "$PORT_B" 5 'AT+CMGL="ALL"' 2>/dev/null)"
-    printf '%s' "$RAW_ONE" >> "$SMS_RAW"
-    sms_parse "$RAW_ONE" > "$STATE/sms_entries_$$_$STORAGE" 2>/dev/null
-    while IFS= read -r entry; do
-      [ -z "$entry" ] && continue
-      idx="$(printf '%s' "$entry" | cut -f1)"
-      num="$(printf '%s' "$entry" | cut -f2)"
-      dt="$(printf '%s' "$entry" | cut -f3)"
-      text="$(printf '%s' "$entry" | cut -f4-)"
-      txt2="$(printf '%s' "$text" | sed 's/\\\\n$//')"
-      # UCS2 -> 中文 解码（发件人号码与正文都可能以 UCS2 十六进制呈现）
-      num_d="$(printf '%s' "$num" | jq -R -r -f /usr/sbin/fm170_ucs2decode.jq 2>/dev/null || printf '%s' "$num")"
-      txt_d="$(printf '%s' "$txt2" | jq -R -r -f /usr/sbin/fm170_ucs2decode.jq 2>/dev/null || printf '%s' "$txt2")"
-      st="$(sms_status_of "$idx" "$RAW_ONE")"
-      [ -z "$st" ] && st="REC UNREAD"
-      # 状态英文 -> 中文，方便前后端/API 直接消费
-      case "$st" in
-        "REC UNREAD") st="未读";;
-        "REC READ") st="已读";;
-        "STO UNSENT") st="待发送";;
-        "STO SENT") st="已发送";;
-      esac
-      msgs="$msgs$sep$(jq -nc --arg index "$idx" --arg storage "$STORAGE" --arg status "$st" --arg sender "$num_d" --arg datetime "$dt" --arg text "$txt_d" '{index:$index,storage:$storage,status:$status,sender:$sender,datetime:$datetime,text:$text}')"
-      sep=","
-    done < "$STATE/sms_entries_$$_$STORAGE"
-    rm -f "$STATE/sms_entries_$$_$STORAGE"
-  done
-  msgs="$msgs]"
+  # 采用与 qmodem 相同的收短信工具 tom_modem（正确处理 PDU 长短信分片 + UCS2 解码）。
+  # 输出 JSON 含 content + reference/total/part；再按 reference 分组、part 升序拼接成完整短信文本。
+  # sms_at_port 优先取 qmodem 配置的短信口，否则沿用 PORT_B。
+  sms_port="${FM170_SMS_PORT:-}"
+  [ -z "$sms_port" ] && sms_port="$(uci -q get qmodem.2_1_2.sms_at_port 2>/dev/null || true)"
+  [ -z "$sms_port" ] && sms_port="$PORT_B"
+  tom_out="$(/usr/bin/tom_modem -d "$sms_port" -o r 2>/dev/null || true)"
+  printf '%s' "$tom_out" > "$SMS_RAW"
+  # 无有效输出 -> 写空列表（避免崩溃/脏缓存）
+  if [ -z "$tom_out" ] || ! printf '%s' "$tom_out" | jq -e '.msg' >/dev/null 2>&1; then
+    printf '[]' > "$TMPF"
+    mv "$TMPF" "$SMS_CACHE" 2>/dev/null || rm -f "$TMPF"
+    log "poll done (no tom_modem output)"
+    return 0
+  fi
+  # 拼接 multipart + 输出兼容 schema：{index,storage,status,sender,datetime,text}
+  # 时间戳用 jq strftime(UTC) 转成 "YY/MM/DD,HH:MM:SS"（tom_modem 的 epoch 数值即本地墙钟）。
+  msgs="$(printf '%s' "$tom_out" | jq -c '
+    .msg
+    | group_by(.reference // ("single-" + (.index|tostring)))
+    | map(
+        if (((.[0].total // 1) > 1) and (.[0].reference? != null)) then
+          (sort_by(.part) | { i: .[0].index, s: .[0].sender, t: .[0].timestamp,
+                              tx: ( map(.content) | join("") ) })
+        else
+          { i: .[0].index, s: .[0].sender, t: .[0].timestamp, tx: .[0].content }
+        end
+      )
+    | sort_by(.t)
+    | map({ index:(.i|tostring), storage:"SM", status:"已读", sender:.s,
+            datetime:(.t | strftime("%y/%m/%d,%H:%M:%S")), text:.tx })
+  ' 2>/dev/null || printf '[]')"
   printf '%s' "$msgs" > "$TMPF"
   mv "$TMPF" "$SMS_CACHE" 2>/dev/null || rm -f "$TMPF"
   log "poll done bytes=$(wc -c < "$SMS_CACHE" 2>/dev/null || echo 0)"

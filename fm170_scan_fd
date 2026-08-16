@@ -5,8 +5,8 @@
 # asynchronous +GTCELLSCAN URCs are captured after the immediate OK.
 
 SCAN_RAW="${1:-/tmp/fm170/cellscan_raw.txt}"
-SCAN_TIMEOUT="${2:-185}"
-SCAN_ATTEMPT_TIMEOUT="${3:-180}"
+SCAN_TIMEOUT="${2:-90}"
+SCAN_ATTEMPT_TIMEOUT="${3:-90}"
 SCAN_MAX_ATTEMPTS="${4:-2}"
 SCAN_RETRY_DELAY="${5:-5}"
 SCAN_QUIET_SECONDS="${6:-10}"
@@ -22,13 +22,13 @@ mono() {
 }
 
 case "$SCAN_TIMEOUT" in
-  ''|*[!0-9]*) SCAN_TIMEOUT=185 ;;
+  ''|*[!0-9]*) SCAN_TIMEOUT=90 ;;
 esac
 if [ "$SCAN_TIMEOUT" -lt 1 ]; then
-  SCAN_TIMEOUT=185
+  SCAN_TIMEOUT=90
 fi
 case "$SCAN_ATTEMPT_TIMEOUT" in
-  ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=180 ;;
+  ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=90 ;;
 esac
 if [ "$SCAN_ATTEMPT_TIMEOUT" -lt 1 ] || [ "$SCAN_ATTEMPT_TIMEOUT" -gt "$SCAN_TIMEOUT" ]; then
   SCAN_ATTEMPT_TIMEOUT="$SCAN_TIMEOUT"
