@@ -469,6 +469,7 @@ const S = {
   roaming: { allowed: false, roaming: false },
   cellDetail: emptyCellDetail(),
   dataSession: emptySession(),
+  temp: null,
   // 扫描
   scan: { ok: false, jobId: '', status: 'idle', trigger: 'manual', startedAt: null, elapsed: 0, finishedAt: null, resultCount: 0, error: '', timeout: 120, attempts: 0, maxAttempts: 2, port: '/dev/ttyUSB1', epoch: 0, updatedAt: '' },
   scanResult: { ok: false, status: 'idle', jobId: '', startedAt: '', finishedAt: '', duration: 0, resultCount: 0, raw: '', cells: [], parserError: '', timestamp: '', scanId: '', scannedAt: '', scanEpoch: 0 },
@@ -519,6 +520,19 @@ function readCache() {
 }
 function writeCache(data) { try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch (_) {} }
 
+function parseTemp(raw) {
+  if (!raw) return null;
+  const keys = ['modem-skin-usr', 'modem-ambient-usr', 'in_temp_pmx65_die_temp_input', 'in_temp_pmx65_ambient_therm_input'];
+  for (const k of keys) {
+    const m = raw.match(new RegExp(k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[:\\s]*(-?\\d+)'));
+    if (!m) continue;
+    const v = Number(m[1]);
+    // 原始值单位是毫摄氏度（如 47622 -> 47.6°C）；过滤明显未连接/异常的负值。
+    if (Number.isFinite(v) && v > -1000 && v < 200000) return (v / 1000).toFixed(1);
+  }
+  return null;
+}
+
 function applyStatus(data) {
   const raw = data.raw || {};
   const cops = splitAfter(lineStarts(raw.COPS, '+COPS:'), '+COPS:');
@@ -553,6 +567,7 @@ function applyStatus(data) {
   S.roaming = connected ? parseRoaming(raw.ROAMCFG) : { allowed: false, roaming: false };
   S.cellDetail = connected ? parseCellDetail(raw.GTCELLINFO) : emptyCellDetail();
   S.dataSession = connected ? parseDataSession(raw.CGCONTRDP, contexts) : emptySession();
+  S.temp = parseTemp(raw.GTLADC);
 }
 
 function loadStatus(force) {
@@ -964,9 +979,10 @@ const Dashboard = {
           { label: '网关', value: S.dataSession.gateway || '--' },
           { label: 'DNS 1', value: S.dataSession.dns[0] || '--' },
         ]))}
-      ${card({ title: '模块', eyebrow: 'ATI / GTCELLINFO' },
+      ${card({ title: '模块', eyebrow: 'ATI / GTCELLINFO / GTLADC' },
         `<div class="module-grid">` + metricGrid([
           { label: '固件', value: S.firmware || '--' },
+          { label: '温度', value: S.temp ?? '--', detail: '°C' },
           { label: 'CQI', value: detail(S.cellDetail.cqi), detail: 'NR' },
           { label: '秩', value: detail(S.cellDetail.rank) },
           { label: '波束 ID', value: detail(S.cellDetail.ssbBeamId) },

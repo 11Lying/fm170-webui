@@ -336,13 +336,14 @@ write_status() {
     --arg gtccinfo "$GTCCINFO" \
     --arg gtcaInfo "$GTCAINFO" \
     --arg gtcellinfo "$GTCELLINFO" \
+    --arg gtlAdc "$GTLADC" \
     --arg celllock "$CELLLOCK" \
     --arg plmnlock "$PLMNLOCK" \
     --arg roamcfg "$ROAMCFG" \
     --arg dualsim "$DUALSIM" \
     --arg cgdcont "$CGDCONT" \
     --arg cgcontrdp "$CGCONTRDP" \
-    '{ok:true,fresh:true,source:"scheduler",phase:$phase,message:$message,updatedAt:$updatedAt,cachedAt:$cachedAt,epoch:($epoch|tonumber),port:$port,statusPort:$statusPort,controlPort:$controlPort,raw:{CGMM:$cgmm,CGMR:$cgmr,GTACT:$gtact,GTACTTEST:$gtactTest,CEREG:$cereg,C5GREG:$c5greg,CGREG:$cgreg,CEMODE:$cemode,COPS:$cops,CESQ:$cesq,GTCCINFO:$gtccinfo,GTCAINFO:$gtcaInfo,GTCELLINFO:$gtcellinfo,CELLLOCK:$celllock,PLMNLOCK:$plmnlock,ROAMCFG:$roamcfg,DUALSIM:$dualsim,CGDCONT:$cgdcont,CGCONTRDP:$cgcontrdp}}' \
+    '{ok:true,fresh:true,source:"scheduler",phase:$phase,message:$message,updatedAt:$updatedAt,cachedAt:$cachedAt,epoch:($epoch|tonumber),port:$port,statusPort:$statusPort,controlPort:$controlPort,raw:{CGMM:$cgmm,CGMR:$cgmr,GTACT:$gtact,GTACTTEST:$gtactTest,CEREG:$cereg,C5GREG:$c5greg,CGREG:$cgreg,CEMODE:$cemode,COPS:$cops,CESQ:$cesq,GTCCINFO:$gtccinfo,GTCAINFO:$gtcaInfo,GTCELLINFO:$gtcellinfo,GTLADC:$gtlAdc,CELLLOCK:$celllock,PLMNLOCK:$plmnlock,ROAMCFG:$roamcfg,DUALSIM:$dualsim,CGDCONT:$cgdcont,CGCONTRDP:$cgcontrdp}}' \
     > "$tmp_file"
   if [ -s "$tmp_file" ]; then
     mv "$tmp_file" "$STATUS_FILE"
@@ -414,12 +415,13 @@ status_once() {
   query_at "AT+GTCELLLOCK?" 3 || { write_error "query" "AT+GTCELLLOCK? timeout"; return 1; }
   CELLLOCK="$AT_RESPONSE"
 
-  # 中频组（CGREG/COPS/GTCAINFO/GTCELLINFO）：每 MID_INTERVAL 秒采集，失败用旧值
+  # 中频组（CGREG/COPS/GTCAINFO/GTCELLINFO/GTLADC）：每 MID_INTERVAL 秒采集，失败用旧值
   if [ $((now_s - last_mid_epoch)) -ge "$MID_INTERVAL" ]; then
     optional_query CGREG "AT+CGREG?" 3
     optional_query COPS "AT+COPS?" 3
     optional_query GTCAINFO "AT+GTCAINFO?" 5
     optional_query GTCELLINFO "AT+GTCELLINFO?" 5
+    optional_query GTLADC "AT+GTLADC" 5
     last_mid_epoch="$now_s"
   fi
 
