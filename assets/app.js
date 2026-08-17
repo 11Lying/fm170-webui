@@ -1627,11 +1627,33 @@ const modeAllows = (rat) => {
   return [2, 4, 10, 16, 20].includes(id);
 };
 const AT_PRESETS = [
-  ['AT+CSQ', '查询信号强度'], ['AT+CESQ', '查询扩展信号质量'], ['AT+COPS?', '查询运营商'], ['AT+CEREG?', '查询 LTE 注册'],
-  ['AT+C5GREG?', '查询 5G 注册'], ['AT+CGREG?', '查询 GPRS 注册'], ['AT+GTCCINFO?', '查询服务小区'], ['AT+GTCAINFO?', '查询载波聚合'],
-  ['AT+GTCELLLOCK?', '查询小区锁定'], ['AT+GTPLMNLOCK?', '查询 PLMN 锁定'], ['AT+GTACT?', '查询网络模式'],
-  ['AT+CGDCONT?', '查询 PDP/APN'], ['AT+CGCONTRDP', '查询地址/DNS'], ['AT+CGMM', '查询模块型号'], ['AT+CGMR', '查询固件版本'],
-  ['AT+CFUN?', '查询功能状态'], ['AT+CFUN=15', '重新注册网络'],
+  ['通用', [
+    ['ATI', '模组信息'], ['AT+CGMM', '模块型号'], ['AT+CGMR', '固件版本'],
+    ['AT+CGSN', '模组 IMEI'], ['AT+GSN', '模组 IMEI'], ['AT+CPIN?', 'SIM 卡状态'],
+    ['AT+CBC', '电压/电池'], ['AT+CSQ', '信号强度'], ['AT+CESQ', '扩展信号质量'],
+    ['AT+COPS?', '运营商'], ['AT+CEREG?', 'LTE 注册'], ['AT+C5GREG?', '5G 注册'],
+    ['AT+CGREG?', 'GPRS 注册'], ['AT+CGDCONT?', 'PDP/APN'], ['AT+CGPADDR', 'PDP 地址'],
+    ['AT+CGCONTRDP', '地址/DNS'], ['AT+CFUN?', '功能状态'], ['AT+CFUN=0', '最小功能'],
+    ['AT+CFUN=1', '全功能'], ['AT+CFUN=1,1', '重启模组'], ['AT+CFUN=15', '重新注册网络'],
+  ]],
+  ['广和通 · 查询', [
+    ['AT+GTDUALSIM?', '双卡状态'], ['AT+PSRAT?', '当前网络类型'],
+    ['AT+GTCCINFO?', '服务小区'], ['AT+GTCAINFO?', '载波聚合'], ['AT+GTCELLINFO?', '小区详情'],
+    ['AT+GTCELLLOCK?', '小区锁定'], ['AT+GTPLMNLOCK?', 'PLMN 锁定'], ['AT+GTACT?', '网络模式'],
+    ['AT+GTROAMCFG?', '漫游配置'], ['AT+GTUSBMODE?', '端口模式'], ['AT+GTSN=0,7', '模组 IMEI'],
+    ['AT+MTSM=1,6', 'BBIC 温度'], ['AT+MTSM=1,7', '射频温度'], ['AT+GTSENRDTEMP=0', '温度'],
+    ['AT+GTSTATIS?', '统计信息'], ['AT+GTLADC', 'ADC 读取'],
+  ]],
+  ['广和通 · 控制', [
+    ['AT+GTDUALSIM=0', '切卡 1'], ['AT+GTDUALSIM=1', '切卡 2'],
+    ['AT+GTACT=2', '锁 4G'], ['AT+GTACT=14', '锁 5G'], ['AT+GTACT=20', '自动网络'],
+    ['AT+GTUSBMODE=32', 'QMI 模式'], ['AT+GTUSBMODE=18', 'ECM 模式'],
+    ['AT+GTUSBMODE=30', 'MBIM 模式'], ['AT+GTUSBMODE=24', 'RNDIS 模式'],
+    ['AT+GTRNDIS=1,1', 'ECM 手动拨号'], ['AT+GTRNDIS=0,1', 'ECM 拨号断开'],
+    ['AT+CGACT=1,3', '手动拨号 (cid3)'], ['AT+CGACT=0,3', '停止拨号'],
+    ['AT+GTFCCLOCKMODE=0', '解锁 FCC'], ['AT+GTESIMCFG=0,0,0', '解除 eSIM 锁定'],
+    ['AT+GTTHERMAL=0', '解除温控'], ['AT+GTCSQNREN=1', 'NR 信号上报'],
+  ]],
 ];
 
 const Settings = {
@@ -1742,7 +1764,7 @@ const Settings = {
       <div class="at-row">
         <select class="in" data-act="at-preset" style="flex:1;min-width:170px">
           <option value="">选择常用 AT 指令…</option>
-          ${AT_PRESETS.map(p => `<option value="${escAttr(p[0])}">${esc(p[0])} — ${esc(p[1])}</option>`).join('')}
+          ${AT_PRESETS.map(g => `<optgroup label="${esc(g[0])}">${g[1].map(p => `<option value="${escAttr(p[0])}">${esc(p[0])} — ${esc(p[1])}</option>`).join('')}</optgroup>`).join('')}
         </select>
         <input class="in" data-act="at-input" style="flex:2;min-width:170px" placeholder="或输入任意单行 AT 指令，例如 AT+CSQ">
         <button class="btn is-primary" type="button" data-act="at-send">${I.bolt}<span>发送</span></button>
@@ -1879,7 +1901,7 @@ async function lockServingCell() {
 async function sendAt() {
   const input = document.querySelector('[data-act="at-input"]');
   const cmd = (input?.value || '').trim();
-  if (!/^AT(?:\+.*)?$/i.test(cmd) || /[\r\n&|;`$()]/.test(cmd)) {
+  if (!/^AT/i.test(cmd) || /[\r\n&|;`$()]/.test(cmd)) {
     S.at.out = '请输入以 AT 开头的单行指令（不允许换行及 & | ; ` $ ( ) 字符）';
     renderAll(); return;
   }

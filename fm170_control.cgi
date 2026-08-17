@@ -400,7 +400,7 @@ do_at() {
   AT_CMD="$PARAM_VALUE"
   # 允许任意单行 AT 指令，禁止 shell/多行注入；实际执行仍由 scheduler 串口队列完成
   case "$AT_CMD" in
-    AT|AT+*|at|at+*) ;;
+    AT*|at*) ;;
     *) json_error "AT 指令必须以 AT 开头"; return ;;
   esac
   if printf '%s' "$AT_CMD" | grep -q '[[:cntrl:]&|;`$()]'; then
