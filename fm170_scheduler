@@ -15,7 +15,7 @@ PORT_B="${FM170_PORT_B:-/dev/ttyUSB1}"
 # ---- 端口自动探测：调度器启动时对 /dev/ttyUSB* 逐个发 AT，挑两个可用的作为 PortA/PortB ----
 # 两个串口底层同功，只是人为分工 A(状态/控制) 与 B(扫描/短信)。
 # 若用户显式指定 FM170_PORT_A/B 且对应串口存在，则优先用户设定，不覆盖。
-# 探测到 >=2 个有效口时，覆盖 PORT_A/PORT_B；否则保留默认并记日志。
+# 探测到 >=2 个有效口时，覆盖 PORT_A/PORT_B；不足时兜底保证指向真实存在的串口。
 probe_port_ok() {
   port="$1"
   [ -e "$port" ] || return 1
@@ -32,28 +32,51 @@ detect_ports() {
   if [ -n "$FM170_PORT_A" ] && [ -e "$FM170_PORT_A" ] && [ -n "$FM170_PORT_B" ] && [ -e "$FM170_PORT_B" ]; then
     return 0
   fi
-  build=""
-  candidates=""
-  for d in /dev/ttyUSB*; do
-    [ -e "$d" ] || continue
-    if probe_port_ok "$d"; then
-      candidates="$candidates $d"
+  # 重启瞬间 USB/串口可能未就绪或模块忙（AT 探活 2s 超时），
+  # 失败时重试 3 次（间隔 3s），避免只探到 1 个口导致 A==B 同口竞争。
+  attempt=0
+  first=""
+  second=""
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    candidates=""
+    for d in /dev/ttyUSB*; do
+      [ -e "$d" ] || continue
+      if probe_port_ok "$d"; then
+        candidates="$candidates $d"
+        [ -n "$first" ] || first="$d"
+        if [ -z "$second" ] && [ "$d" != "$first" ]; then second="$d"; fi
+      fi
+    done
+    # 取前两个【不同】的口分配给 A/B；不足两口或 A==B 时重试
+    a=""
+    b=""
+    for c in $candidates; do
+      [ -n "$a" ] || { a="$c"; continue; }
+      [ -n "$b" ] && break
+      [ "$c" != "$a" ] && b="$c"
+    done
+    if [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]; then
+      PORT_A="$a"
+      PORT_B="$b"
+      log "ports autoprobed A=$PORT_A B=$PORT_B (candidates:$candidates)"
+      return 0
     fi
+    log "ports autoprobe insufficient (attempt $attempt: $candidates), retry in 3s"
+    sleep 3
   done
-  count=0
-  for c in $candidates; do
-    count=$((count + 1))
-    case "$count" in
-      1) PORT_A="$c" ;;
-      2) PORT_B="$c" ;;
-    esac
-    [ "$count" -ge 2 ] && break
-  done
-  if [ "$count" -ge 2 ]; then
-    log "ports autoprobed A=$PORT_A B=$PORT_B (candidates:$candidates)"
-  else
-    log "ports autoprobe insufficient (found $count), keep A=$PORT_A B=$PORT_B"
+  # 兜底：至少保证 A/B 指向真实存在的串口，避免 status/scan 打到不存在的设备。
+  if [ ! -e "$PORT_A" ] && [ -n "$first" ]; then
+    PORT_A="$first"
   fi
+  if [ ! -e "$PORT_B" ]; then
+    if [ -n "$second" ]; then
+      PORT_B="$second"
+    else
+      [ -n "$first" ] && PORT_B="$first"
+    fi
+  fi
+  log "ports autoprobe failed after 3 attempts, use A=$PORT_A B=$PORT_B"
 }
 
 STATE_DIR="${FM170_STATE_DIR:-/tmp/fm170}"
@@ -88,8 +111,8 @@ A_PID_FILE="/var/run/fm170_scheduler_a.pid"
 B_PID_FILE="/var/run/fm170_scheduler_b.pid"
 
 STATUS_INTERVAL="${FM170_STATUS_INTERVAL:-3}"
-SCAN_TIMEOUT="${FM170_SCAN_TIMEOUT:-90}"
-SCAN_ATTEMPT_TIMEOUT="${FM170_SCAN_ATTEMPT_TIMEOUT:-90}"
+SCAN_TIMEOUT="${FM170_SCAN_TIMEOUT:-180}"
+SCAN_ATTEMPT_TIMEOUT="${FM170_SCAN_ATTEMPT_TIMEOUT:-180}"
 SCAN_MAX_ATTEMPTS="${FM170_SCAN_MAX_ATTEMPTS:-3}"
 SCAN_RETRY_DELAY="${FM170_SCAN_RETRY_DELAY:-5}"
 SCAN_QUIET_SECONDS="${FM170_SCAN_QUIET_SECONDS:-10}"
@@ -97,7 +120,7 @@ CONTROL_TIMEOUT="${FM170_CONTROL_TIMEOUT:-8}"
 SCAN_STARTED_TEXT=""
 SCAN_TRIGGER="manual"
 CURRENT_ATTEMPT=1
-CURRENT_MAX_ATTEMPTS=2
+CURRENT_MAX_ATTEMPTS=3
 
 NL='
 '
@@ -109,13 +132,13 @@ if [ "$STATUS_INTERVAL" -lt 1 ]; then
   STATUS_INTERVAL=3
 fi
 case "$SCAN_TIMEOUT" in
-  ''|*[!0-9]*) SCAN_TIMEOUT=90 ;;
+  ''|*[!0-9]*) SCAN_TIMEOUT=180 ;;
 esac
 if [ "$SCAN_TIMEOUT" -lt 1 ]; then
-  SCAN_TIMEOUT=90
+  SCAN_TIMEOUT=180
 fi
   case "$SCAN_ATTEMPT_TIMEOUT" in
-    ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=90 ;;
+    ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=180 ;;
 esac
 if [ "$SCAN_ATTEMPT_TIMEOUT" -lt 1 ] || [ "$SCAN_ATTEMPT_TIMEOUT" -gt "$SCAN_TIMEOUT" ]; then
   SCAN_ATTEMPT_TIMEOUT="$SCAN_TIMEOUT"
@@ -253,27 +276,6 @@ is_integer() {
     -[0-9]*) return 0 ;;
     *[!0-9]*) return 1 ;;
   esac
-  return 0
-}
-
-drain_fd() {
-  fd="$1"
-  drain_start="$(date +%s)"
-  drain_deadline=$((drain_start + 1))
-  while [ "$(date +%s)" -lt "$drain_deadline" ]; do
-    IFS= read -r -t 1 _drain_line <&$fd
-  done
-}
-
-open_port() {
-  fd="$1"
-  port="$2"
-  eval "exec $fd<&-" 2>/dev/null
-  eval "exec $fd<>\"$port\"" 2>/dev/null || return 1
-  if ! stty -F "$port" 115200 raw -echo <&$fd >/dev/null 2>&1; then
-    stty raw -echo <&$fd >/dev/null 2>&1
-  fi
-  drain_fd "$fd"
   return 0
 }
 
@@ -537,8 +539,8 @@ worker_a() {
   last_slow_epoch=0
   # 只有 WebUI 最近有访问时才执行状态轮询；控制队列/扫描仍可被即时处理。
   while :; do
-    if next_control_request; then
-      control_request="$(next_control_request)"
+    control_request="$(next_control_request)"
+    if [ -n "$control_request" ]; then
       # 记录控制命令：若涉及状态类控制（锁频/网络模式/锁PLMN），成功后即时刷新中/低频组
       ctrl_cmd="$(cat "$control_request" 2>/dev/null | jq -r '.command // ""' 2>/dev/null)"
       process_control "$control_request"
@@ -608,7 +610,7 @@ write_scan_status() {
   fi
   # 封顶 elapsed：避免时钟异常/进程挂起导致写入超大值(如 28690s)
   case "$SCAN_TIMEOUT" in
-    ''|*[!0-9]*) SCAN_TIMEOUT=90 ;;
+    ''|*[!0-9]*) SCAN_TIMEOUT=180 ;;
   esac
   max_elapsed=$((SCAN_TIMEOUT + 30))
   if [ "$elapsed" -gt "$max_elapsed" ]; then
@@ -783,97 +785,13 @@ parse_cells() {
   fi
 }
 
-collect_scan() {
-  job_started_at="$1"
-  attempt_started_at="$2"
-  attempt_timeout="$3"
-  job_deadline=$((job_started_at + SCAN_TIMEOUT))
-  deadline=$((attempt_started_at + attempt_timeout))
-  if [ "$job_deadline" -lt "$deadline" ]; then
-    deadline="$job_deadline"
-  fi
-  last_data_at="$attempt_started_at"
-  last_status_at="$attempt_started_at"
-  saw_cell=0
-  saw_any=0
-  saw_lte_no_sib1=0
-  saw_nr_no_sib1=0
-  printf '%s\n' "--- attempt $CURRENT_ATTEMPT ---" >> "$SCAN_RAW"
-  log "cellscan command_sent job=$JOB_ID attempt=$CURRENT_ATTEMPT port=$PORT_B"
-  printf 'AT+GTCELLSCAN\r' >&6 || return 1
-
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if IFS= read -r -t 1 line <&6; then
-      clean_line="$(printf '%s' "$line" | tr -d '\r')"
-      printf '%s\n' "$clean_line" >> "$SCAN_RAW"
-      now_epoch="$(date +%s)"
-      elapsed=$((now_epoch - job_started_at))
-      if [ "$elapsed" -lt 0 ]; then elapsed=0; fi
-
-      case "$clean_line" in
-        *ERROR*)
-          write_scan_status "failed" "$JOB_ID" "$job_started_at" "$elapsed" "" "0" "AT+GTCELLSCAN returned ERROR"
-          return 1
-          ;;
-        +GTCELLSCAN:*)
-          if [ "$saw_any" = "0" ]; then
-            saw_any=1
-            log "cellscan urc_received job=$JOB_ID attempt=$CURRENT_ATTEMPT"
-          fi
-          case "$clean_line" in
-            *"There is no sib1"*|*"There is no SIB1"*)
-              case "$clean_line" in
-                +GTCELLSCAN:\ 4,*|+GTCELLSCAN:\ 4,*) saw_lte_no_sib1=1 ;;
-                +GTCELLSCAN:\ 5,*|+GTCELLSCAN:\ 5,*) saw_nr_no_sib1=1 ;;
-              esac
-              ;;
-            *)
-              saw_cell=1
-              last_data_at="$now_epoch"
-              ;;
-          esac
-          ;;
-      esac
-
-      if [ "$saw_cell" = "1" ] && [ $((now_epoch - last_data_at)) -ge "$SCAN_QUIET_SECONDS" ]; then
-        return 0
-      fi
-      if [ "$saw_cell" = "0" ] && [ "$saw_lte_no_sib1" = "1" ] && [ "$saw_nr_no_sib1" = "1" ]; then
-        return 3
-      fi
-      if [ $((now_epoch - last_status_at)) -ge 2 ]; then
-        write_scan_status "running" "$JOB_ID" "$job_started_at" "$elapsed" "" "0" ""
-        last_status_at="$now_epoch"
-      fi
-    fi
-
-    now_epoch="$(date +%s)"
-    if [ "$saw_cell" = "1" ] && [ $((now_epoch - last_data_at)) -ge "$SCAN_QUIET_SECONDS" ]; then
-      return 0
-    fi
-    if [ "$saw_cell" = "0" ] && [ "$saw_lte_no_sib1" = "1" ] && [ "$saw_nr_no_sib1" = "1" ]; then
-      return 3
-    fi
-    elapsed=$((now_epoch - job_started_at))
-    if [ "$elapsed" -lt 0 ]; then elapsed=0; fi
-    if [ $((now_epoch - last_status_at)) -ge 5 ]; then
-      write_scan_status "running" "$JOB_ID" "$job_started_at" "$elapsed" "" "0" ""
-      last_status_at="$now_epoch"
-    fi
-  done
-  if [ "$saw_cell" = "1" ]; then
-    return 0
-  fi
-  return 2
-}
-
 run_cellscan_job() {
   [ -f "$SCAN_REQUEST" ] || return 0
   req="$(cat "$SCAN_REQUEST" 2>/dev/null)"
   JOB_ID="$(printf '%s' "$req" | jq -r '.jobId // "unknown"' 2>/dev/null)"
   request_timeout="$(printf '%s' "$req" | jq -r '.timeout // 180' 2>/dev/null)"
-  request_attempt_timeout="$(printf '%s' "$req" | jq -r '.attemptTimeout // 90' 2>/dev/null)"
-  request_max_attempts="$(printf '%s' "$req" | jq -r '.maxAttempts // 2' 2>/dev/null)"
+  request_attempt_timeout="$(printf '%s' "$req" | jq -r '.attemptTimeout // 180' 2>/dev/null)"
+  request_max_attempts="$(printf '%s' "$req" | jq -r '.maxAttempts // 3' 2>/dev/null)"
   request_retry_delay="$(printf '%s' "$req" | jq -r '.retryDelay // 5' 2>/dev/null)"
   request_trigger="$(printf '%s' "$req" | jq -r '.trigger // "manual"' 2>/dev/null)"
   case "$request_timeout" in
@@ -883,13 +801,13 @@ run_cellscan_job() {
     request_timeout=180
   fi
   case "$request_attempt_timeout" in
-    ''|*[!0-9]*) request_attempt_timeout=90 ;;
+    ''|*[!0-9]*) request_attempt_timeout=180 ;;
   esac
   if [ "$request_attempt_timeout" -lt 1 ] || [ "$request_attempt_timeout" -gt "$request_timeout" ]; then
     request_attempt_timeout="$request_timeout"
   fi
   case "$request_max_attempts" in
-    ''|*[!0-9]*) request_max_attempts=2 ;;
+    ''|*[!0-9]*) request_max_attempts=3 ;;
   esac
   if [ "$request_max_attempts" -lt 1 ]; then
     request_max_attempts=1
@@ -1067,6 +985,8 @@ stop_workers() {
 
 master() {
   mkdir -p "$STATE_DIR" "$CTRL_QUEUE"
+  # 清理历史遗留的孤儿响应文件（CGI 已超时放弃的），避免 /tmp 里无限堆积。
+  rm -f "$CTRL_QUEUE"/resp-*.json 2>/dev/null
   # 规范化陈旧的扫描状态：避免上一轮扫描因时钟/进程异常残留成长期 running 或超大 elapsed
   if [ -f "$SCAN_STATUS" ]; then
     st="$(jq -r '.status // ""' "$SCAN_STATUS" 2>/dev/null || echo '')"

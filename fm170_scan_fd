@@ -5,15 +5,30 @@
 # asynchronous +GTCELLSCAN URCs are captured after the immediate OK.
 
 SCAN_RAW="${1:-/tmp/fm170/cellscan_raw.txt}"
-SCAN_TIMEOUT="${2:-90}"
-SCAN_ATTEMPT_TIMEOUT="${3:-90}"
+SCAN_TIMEOUT="${2:-180}"
+SCAN_ATTEMPT_TIMEOUT="${3:-180}"
 SCAN_MAX_ATTEMPTS="${4:-2}"
 SCAN_RETRY_DELAY="${5:-5}"
 SCAN_QUIET_SECONDS="${6:-10}"
 PORT_B="${7:-/dev/ttyUSB1}"
 
-# Do not inherit scheduler lock/control descriptors into the serial reader.
-exec 9<&- 2>/dev/null
+# 串口互斥：与 fm170_at.sh 共用同一把锁（FM170_AT_LOCKDIR/at_lock.<port>），
+# 避免与短信 tom_modem / 手动 AT / 状态查询同时打开同一串口导致竞争。
+# 注意：不能用 "exec 9<&-" 先关闭 fd9 —— busybox ash 关闭未打开的 fd 会直接退出脚本。
+LOCKDIR="${FM170_AT_LOCKDIR:-/tmp/fm170}"
+mkdir -p "$LOCKDIR" 2>/dev/null
+LOCK="$LOCKDIR/at_lock.$(basename "$PORT_B")"
+exec 9>"$LOCK"
+# busybox flock 不支持 -w 超时，改用非阻塞 + 自旋重试（最多 10s）
+# 避免与短信 tom_modem / 手动 AT 同时打开同一串口竞争。
+got_lock=0
+lock_try=0
+while [ "$lock_try" -lt 10 ]; do
+  if flock -n 9 2>/dev/null; then got_lock=1; break; fi
+  lock_try=$((lock_try + 1))
+  sleep 1
+done
+[ "$got_lock" = "1" ] || { echo "SCAN_BUSY:$PORT_B"; exit 4; }
 
 # 单调时钟: 用 /proc/uptime 秒数, 不受 NTP/date 跳变影响。
 # GTCELLSCAN 的 deadline/elapsed 必须用它, 否则 NTP 校时(设备无RTC)会让扫描计时错乱/卡死。
@@ -22,13 +37,13 @@ mono() {
 }
 
 case "$SCAN_TIMEOUT" in
-  ''|*[!0-9]*) SCAN_TIMEOUT=90 ;;
+  ''|*[!0-9]*) SCAN_TIMEOUT=180 ;;
 esac
 if [ "$SCAN_TIMEOUT" -lt 1 ]; then
-  SCAN_TIMEOUT=90
+  SCAN_TIMEOUT=180
 fi
 case "$SCAN_ATTEMPT_TIMEOUT" in
-  ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=90 ;;
+  ''|*[!0-9]*) SCAN_ATTEMPT_TIMEOUT=180 ;;
 esac
 if [ "$SCAN_ATTEMPT_TIMEOUT" -lt 1 ] || [ "$SCAN_ATTEMPT_TIMEOUT" -gt "$SCAN_TIMEOUT" ]; then
   SCAN_ATTEMPT_TIMEOUT="$SCAN_TIMEOUT"
@@ -120,10 +135,16 @@ while [ "$attempt" -le "$SCAN_MAX_ATTEMPTS" ]; do
       if [ "$saw_cell" = "1" ] && [ $((now_epoch - last_data_at)) -ge "$SCAN_QUIET_SECONDS" ]; then
         exit 0
       fi
+      if [ "$saw_cell" = "0" ] && [ "$saw_lte_no_sib1" = "1" ] && [ "$saw_nr_no_sib1" = "1" ]; then
+        exit 3
+      fi
     fi
     now_epoch="$(mono)"
     if [ "$saw_cell" = "1" ] && [ $((now_epoch - last_data_at)) -ge "$SCAN_QUIET_SECONDS" ]; then
       exit 0
+    fi
+    if [ "$saw_cell" = "0" ] && [ "$saw_lte_no_sib1" = "1" ] && [ "$saw_nr_no_sib1" = "1" ]; then
+      exit 3
     fi
   done
 

@@ -1,6 +1,14 @@
 #!/bin/sh
 # FM170-EAU independent Port B (ttyUSB1) SMS task (invoked once per call).
-PORT_B="${SMS_PORT_B:-/dev/ttyUSB1}"
+# 短信口跟随调度器自动探测的 B 口（扫描+SMS 同口），避免与状态口(A)竞争。
+PORT_B="${SMS_PORT_B:-}"
+if [ -z "$PORT_B" ]; then
+  PORT_B="$(jq -r '.B.port // ""' "${SMS_PORTS_FILE:-/tmp/fm170/ports.json}" 2>/dev/null)"
+fi
+case "$PORT_B" in
+  /dev/ttyUSB*) ;;
+  *) PORT_B="/dev/ttyUSB1" ;;
+esac
 STATE="${SMS_STATE_DIR:-/tmp/fm170}"
 SMS_CACHE="$STATE/sms_messages.json"
 SMS_RAW="$STATE/sms_raw.txt"
@@ -99,7 +107,32 @@ poll() {
   sms_port="${FM170_SMS_PORT:-}"
   [ -z "$sms_port" ] && sms_port="$(uci -q get qmodem.2_1_2.sms_at_port 2>/dev/null || true)"
   [ -z "$sms_port" ] && sms_port="$PORT_B"
-  tom_out="$(/usr/bin/tom_modem -d "$sms_port" -o r 2>/dev/null || true)"
+  # 串口互斥：与 fm170_at.sh / fm170_scan_fd 共用同一把锁（at_lock.<port>）。
+  # tom_modem 裸开串口，不加锁会与扫描/状态查询竞争；模块 AT 引擎为共享串行，
+  # 状态轮询(每 3s)可能打断 tom_modem 的连续 AT 会话，故输出为空时自动重试 3 次。
+  SMS_LOCK="$STATE/at_lock.$(basename "$sms_port")"
+  TOM_TMP="$STATE/sms_tom_out.$$"
+  tom_out=""
+  try=0
+  while [ "$try" -lt 3 ]; do
+    try=$((try + 1))
+    (
+      exec 9>"$SMS_LOCK" 2>/dev/null
+      # busybox flock 不支持 -w，用非阻塞；拿不到锁本次跳过（外层已有 3 次重试）
+      if flock -n 9 2>/dev/null; then
+        /usr/bin/tom_modem -d "$sms_port" -o r > "$TOM_TMP" 2>/dev/null
+      else
+        log "poll skipped (serial busy: $sms_port)"
+        : > "$TOM_TMP"
+      fi
+    )
+    tom_out="$(cat "$TOM_TMP" 2>/dev/null || true)"
+    if [ -n "$tom_out" ] && printf '%s' "$tom_out" | jq -e '.msg' >/dev/null 2>&1; then
+      break
+    fi
+    [ "$try" -lt 3 ] && sleep 2
+  done
+  rm -f "$TOM_TMP"
   printf '%s' "$tom_out" > "$SMS_RAW"
   # 无有效输出 -> 写空列表（避免崩溃/脏缓存）
   if [ -z "$tom_out" ] || ! printf '%s' "$tom_out" | jq -e '.msg' >/dev/null 2>&1; then
@@ -135,19 +168,23 @@ poll() {
 
 rd() {
   scan_gate || return 1
-  at "AT+CMGR=$2"
+  idx="$2"
+  case "$idx" in ''|*[!0-9]*) echo "{\"ok\":false,\"error\":\"index must be numeric\"}"; return 2;; esac
+  at "AT+CMGR=$idx"
   printf '%s' "$RX"
 }
 
 del() {
   scan_gate || return 1
+  idx="$2"
+  case "$idx" in ''|*[!0-9]*) echo "{\"ok\":false,\"error\":\"index must be numeric\"}"; return 2;; esac
   # 短信实际落在 ME(模块) 或 SM(SIM)。删除前必须先切到对应存储，否则 CMGD 删错/删不掉。
   # 优先 ME（当前短信主要落在 ME），失败再试 SM。
   at 'AT+CPMS="ME"'
-  at "AT+CMGD=$2"; rc="$?"
+  at "AT+CMGD=$idx"; rc="$?"
   if [ "$rc" != "0" ]; then
     at 'AT+CPMS="SM"'
-    at "AT+CMGD=$2"; rc="$?"
+    at "AT+CMGD=$idx"; rc="$?"
   fi
   [ "$rc" = "0" ] && poll >/dev/null 2>&1
   return "$rc"

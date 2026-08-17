@@ -151,7 +151,7 @@ ppp_start() {
     echo "$pid" > "$PID_FILE"
     jq -n --arg pid "$pid" '{ok:true,dialing:true,pid:$pid,message:"拨号已启动，等待获取 IP..."}'
   else
-    jq -n --arg errortail "$(tail -20 "$LOG_FILE" 2>/dev/null | tr '\n' ' ')" '{ok:false,dialing:false,error:"拨号进程未能启动，日志结尾：'"$errortail"'"}' 
+    jq -n --arg errortail "$(tail -20 "$LOG_FILE" 2>/dev/null | tr '\n' ' ')" '{ok:false,dialing:false,error:("拨号进程未能启动，日志结尾：" + $errortail)}'
   fi
 }
 
@@ -239,7 +239,7 @@ submit_control_request() {
   deadline=$(( $(date +%s) + timeout_seconds + 10 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if [ -f "$response_file" ]; then cat "$response_file"; rm -f "$response_file"; return 0; fi
-    sleep 0.2
+    sleep 1
   done
   json_error "AT scheduler did not respond"
 }

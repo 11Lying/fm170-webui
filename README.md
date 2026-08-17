@@ -39,13 +39,16 @@ master (fm170_scheduler)
 | `fm170_sms_check.sh` | SMS 检查脚本（**已改为手动刷新**） |
 | `fm170_log_trim.sh` | /tmp/fm170 日志体积控制 |
 | `fm170_api.cgi` | 状态/扫描/SMS/端口 API |
-| `fm170_control.cgi` | 控制链路（网络模式/锁频/锁小区/PLMN/SMS AT） |
+| `fm170_control.cgi` | 控制链路（网络模式/锁频/锁小区/PLMN/free AT/查询） |
 | `fm170_dial.cgi` | 独立 QMI 拨号控制器（支持可选手动 APN） |
-| `dial.html` | WebUI 独立拨号页面（含 APN 输入框） |
+| `fm170_webui_dial.init` | 开机拨号 procd 服务（复用 dial.cgi 的 ppp_start） |
 | `fm170_scan.sh` | 命令行扫描请求入口 |
-| `index.html` | WebUI 入口 |
-| `index-DLZvxu_t.js` | WebUI 前端 bundle（状态/扫描/SMS 页面） |
-| `fm170-ux.js` | WebUI 运行时注入脚本 |
+| `index.html` | WebUI 入口（单页应用外壳） |
+| `assets/app.js` | WebUI 前端（无构建、无框架；统一首页/载波/邻区/短信/拨号/设置 6 页） |
+| `assets/app.css` | 统一组件样式（依赖 design-tokens.css，响应式 768/1024/1440） |
+| `assets/design-tokens.css` | 设计令牌（颜色/圆角/间距/图标尺寸/断点/卡片高度规范，全站唯一变量来源） |
+| `sms.html` / `dial.html` | 旧独立页跳转占位（重定向到 `index.html#/sms`、`#/dial`） |
+| `dev/mock-server.js` | 本地开发模拟后端（模拟三个 CGI，无硬件可跑前端） |
 
 ## 特性
 
@@ -59,13 +62,14 @@ master (fm170_scheduler)
 - **自动端口探测**：调度器启动时对 /dev/ttyUSB* 逐个发 AT，自动挑选两个可用串口作为 A(状态/控制)/B(扫描/短信)，抗 USB 重枚举导致的串口漂移
 - **短信手动刷新**：不再自动 poll，用户在短信页点"刷新短信"才更新
 - **WebUI 按需采集**：调度器仅在 WebUI 租约有效时执行状态 AT 采集；页面关闭/超时后只保留轻量 worker，不再持续占用串口轮询
-- **手动刷新**：前端拦截原有状态定时器，只有点击“手动刷新”才重新读取完整状态
+- **手动刷新**：前端不再自动轮询状态，页顶“手动刷新”才重新读取完整状态；视图切换时若距上次读取超过 20s 会自动补一次
 - **状态缓存**：最近一次完整 status 响应同时保存在 `/tmp/fm170/status.json` 和浏览器 `localStorage`；无刷新时优先展示缓存，网络暂时失败也不清空页面
-- **控制免登录**：移除 WebUI 控制接口的 sid/session 校验，局域网访问边界交给路由器防火墙
-- **高级 AT 控制**：支持常用 AT 下拉选择和任意单行 AT 指令，经 control queue 串行执行；返回区仅显示模块原生回显，不显示 JSON 包装，并按终端样式多行换行
+- **控制免登录**：移除 WebUI 控制接口的 sid/session 校验，前端无登录弹窗，局域网访问边界交给路由器防火墙
+- **高级 AT 控制**：设置页内置常用 AT 下拉 + 任意单行 AT 指令，经 control queue 串行执行；输出为模块原生回显（终端样式多行）
 - **WebUI 拨号开机自启**：`fm170_webui_dial` 通过 `fm170_dial.cgi?action=ppp_start` 启动，不使用 qmodem 拨号
 - status.json schema 兼容（19 个 raw 字段全保留）
-- 拨号页 `dial.html` 支持可选 APN（默认 auto，可手填固定 APN）
+- 拨号页支持可选 APN（默认 auto，可手填固定 APN）
+- **统一单页前端**：首页/载波/邻区/短信/拨号/设置合并为单一 SPA（hash 路由），无构建步骤、无框架依赖；旧 `/sms.html`、`/dial.html` 地址自动跳转
 
 ## 按需采集与开机拨号
 
@@ -89,11 +93,16 @@ master (fm170_scheduler)
 /www/cgi-bin/fm170_dial.cgi
 /www/cgi-bin/fm170_scan.sh
 /www/fm170/index.html
+/www/fm170/assets/design-tokens.css
+/www/fm170/assets/app.js
+/www/fm170/assets/app.css
+/www/fm170/sms.html
 /www/fm170/dial.html
-/www/fm170/assets/index-DLZvxu_t.js
-/www/fm170/fm170-ux.js
 /usr/sbin/fm170_log_trim.sh
+/etc/init.d/fm170_webui_dial        (可选，开机自动拨号)
 ```
+
+前端为无构建静态文件：`index.html` + `assets/design-tokens.css` + `assets/app.js` + `assets/app.css` 即可运行；短信与拨号已合并进单页，旧独立页保留为跳转占位。本地开发可运行 `node dev/mock-server.js`（模拟全部 CGI，免硬件）。
 
 调度器由 procd 管理（`/etc/init.d/fm170_scheduler`）。
 

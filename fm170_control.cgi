@@ -143,7 +143,7 @@ submit_control_request() {
       cat "$response_file"
       return 0
     fi
-    sleep 0.2
+    sleep 1
   done
   json_error "AT scheduler did not respond"
 }

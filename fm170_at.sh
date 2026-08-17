@@ -11,7 +11,10 @@ flock 9 || { echo "AT_BUSY:$PORT"; exit 3; }
 
 # 构造发送: 每条命令以 \r 结尾, 多条用 \r\n
 inp="$*"
-if [ "$1" = "-m" ]; then inp="$*"; fi
+if [ "$1" = "-m" ]; then
+  shift
+  inp="$*"
+fi
 payload=$(printf '%s' "$inp" | awk '{ printf "%s\r", $0 }')
 
 # 发送(不转换换行), raw 模式, echo关闭
