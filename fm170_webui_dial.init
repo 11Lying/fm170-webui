@@ -1,0 +1,33 @@
+#!/bin/sh /etc/rc.common
+# FM170 WebUI 拨号开机自启：调用与 WebUI 拨号按钮相同的 fm170_dial.cgi 后端
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /bin/sh -c '
+        sleep 15
+        i=0
+        while [ "$i" -lt 12 ]; do
+            if command -v uclient-fetch >/dev/null 2>&1; then
+                uclient-fetch -qO- "http://127.0.0.1/cgi-bin/fm170_dial.cgi?action=ppp_start&apn=auto&boot=1" >/tmp/fm170/auto_dial.last 2>&1 && exit 0
+            else
+                wget -qO- "http://127.0.0.1/cgi-bin/fm170_dial.cgi?action=ppp_start&apn=auto&boot=1" >/tmp/fm170/auto_dial.last 2>&1 && exit 0
+            fi
+            i=$((i + 1)); sleep 5
+        done
+    '
+    procd_set_param respawn 3600 5 3
+    procd_close_instance
+}
+
+stop_service() {
+    # 停止自启任务本身；不主动断开当前拨号，避免重载服务造成掉线
+    return 0
+}
+
+service_triggers() {
+    procd_add_reload_trigger network
+}
+

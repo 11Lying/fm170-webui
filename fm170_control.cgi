@@ -86,13 +86,11 @@ session_valid() {
   return 1
 }
 
+# FM170 WebUI 控制接口不启用 LuCI/session 登录；访问控制交给路由器局域网和防火墙。
+# 保留函数名以兼容已有调用方，但不再要求 sid，也不再弹出控制登录。
 require_auth() {
-  query_param sid
-  SID="$(urldecode "$query_value")"
-  if ! session_valid "$SID"; then
-    send_denied
-    exit 0
-  fi
+  SID=""
+  return 0
 }
 
 daemon_running() {
@@ -397,6 +395,26 @@ do_restart() {
   send_control "AT+CFUN=1,1" 20
 }
 
+do_at() {
+  string_param cmd
+  AT_CMD="$PARAM_VALUE"
+  # 允许任意单行 AT 指令，禁止 shell/多行注入；实际执行仍由 scheduler 串口队列完成
+  case "$AT_CMD" in
+    AT|AT+*|at|at+*) ;;
+    *) json_error "AT 指令必须以 AT 开头"; return ;;
+  esac
+  if printf '%s' "$AT_CMD" | grep -q '[[:cntrl:]&|;`$()]'; then
+    json_error "AT 指令包含非法字符"
+    return
+  fi
+  if [ "${#AT_CMD}" -gt 256 ]; then
+    json_error "AT 指令过长（最多 256 字符）"
+    return
+  fi
+  resp="$(send_control "$AT_CMD" "${AT_TIMEOUT:-12}")"
+  jq -n --arg cmd "$AT_CMD" --argjson r "$resp" '{ok:($r.ok // false),command:$cmd,raw:($r.raw // ""),error:($r.error // "")} '
+}
+
 do_query() {
   string_param query
   QUERY="$PARAM_VALUE"
@@ -664,6 +682,10 @@ case "$QUERY_STRING" in
   *action=query*)
     require_auth
     do_query | send_json
+    ;;
+  *action=at*)
+    require_auth
+    do_at | send_json
     ;;
 
   *action=sms_list*)

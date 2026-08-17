@@ -58,8 +58,22 @@ master (fm170_scheduler)
 - 邻区扫描仅手动触发（无 boot/periodic/stale 自动扫描）
 - **自动端口探测**：调度器启动时对 /dev/ttyUSB* 逐个发 AT，自动挑选两个可用串口作为 A(状态/控制)/B(扫描/短信)，抗 USB 重枚举导致的串口漂移
 - **短信手动刷新**：不再自动 poll，用户在短信页点"刷新短信"才更新
+- **WebUI 按需采集**：调度器仅在 WebUI 租约有效时执行状态 AT 采集；页面关闭/超时后只保留轻量 worker，不再持续占用串口轮询
+- **手动刷新**：前端拦截原有状态定时器，只有点击“手动刷新”才重新读取完整状态
+- **状态缓存**：最近一次完整 status 响应同时保存在 `/tmp/fm170/status.json` 和浏览器 `localStorage`；无刷新时优先展示缓存，网络暂时失败也不清空页面
+- **控制免登录**：移除 WebUI 控制接口的 sid/session 校验，局域网访问边界交给路由器防火墙
+- **高级 AT 控制**：支持常用 AT 下拉选择和任意单行 AT 指令，经 control queue 串行执行；返回区仅显示模块原生回显，不显示 JSON 包装，并按终端样式多行换行
+- **WebUI 拨号开机自启**：`fm170_webui_dial` 通过 `fm170_dial.cgi?action=ppp_start` 启动，不使用 qmodem 拨号
 - status.json schema 兼容（19 个 raw 字段全保留）
 - 拨号页 `dial.html` 支持可选 APN（默认 auto，可手填固定 APN）
+
+## 按需采集与开机拨号
+
+- `/tmp/fm170/webui.lease` 是 WebUI 活跃租约，默认 45 秒；前端每 20 秒续租。
+- `fm170_scheduler` 只有租约有效时才执行 `status_once()`；租约过期后 worker A 进入 idle，不再访问串口。
+- `/cgi-bin/fm170_api.cgi?action=ui_open|ui_refresh|ui_close` 管理租约。
+- `fm170_webui_dial` 是开机拨号服务，调用和 WebUI 拨号按钮相同的 `fm170_dial.cgi`，不会调用 qmodem 拨号。
+- `socat` 作为 AT 串口访问依赖已安装。
 
 ## 部署
 

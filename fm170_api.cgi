@@ -111,13 +111,10 @@ session_valid() {
   return 1
 }
 
+# WebUI 不启用控制登录；局域网访问和路由器防火墙负责边界保护。
 require_auth() {
-  query_param sid
-  SID="$(urldecode "$query_value")"
-  if ! session_valid "$SID"; then
-    send_denied
-    exit 0
-  fi
+  SID=""
+  return 0
 }
 
 daemon_running() {
@@ -322,6 +319,26 @@ cellscan_start() {
 }
 
 
+ui_lease_payload() {
+  lease_file="${FM170_STATE_DIR:-/tmp/fm170}/webui.lease"
+  case "$1" in
+    open)
+      mkdir -p "${FM170_STATE_DIR:-/tmp/fm170}"
+      printf '%s\n' "$(date +%s)" > "$lease_file"
+      jq -n --arg leaseSeconds "${FM170_UI_LEASE_SECONDS:-45}" '{ok:true,active:true,leaseSeconds:($leaseSeconds|tonumber)}'
+      ;;
+    close)
+      rm -f "$lease_file"
+      jq -n '{ok:true,active:false}'
+      ;;
+    refresh)
+      mkdir -p "${FM170_STATE_DIR:-/tmp/fm170}"
+      printf '%s\n' "$(date +%s)" > "$lease_file"
+      jq -n '{ok:true,active:true,refreshed:true}'
+      ;;
+  esac
+}
+
 sms_status_payload() {
   SMS_CACHE="${FM170_STATE_DIR:-/tmp/fm170}/sms_messages.json"
   if [ -f "$SMS_CACHE" ] && [ -s "$SMS_CACHE" ]; then
@@ -340,6 +357,15 @@ sms_status_payload() {
 
 
 case "$QUERY_STRING" in
+  *action=ui_open*)
+    ui_lease_payload open | send_json
+    ;;
+  *action=ui_refresh*)
+    ui_lease_payload refresh | send_json
+    ;;
+  *action=ui_close*)
+    ui_lease_payload close | send_json
+    ;;
   *action=ping*)
     jq -n --arg now "$(date '+%Y-%m-%d %H:%M:%S')" '{ok:true,action:"ping",now:$now}' | send_json
     ;;

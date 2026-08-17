@@ -200,3 +200,76 @@
   setInterval(apply, 1200);
   schedule();
 })();
+
+/* FM170 按需采集：页面打开才续租，状态数据不再自动打串口；手动刷新时整页重新取一次。 */
+(() => {
+  const API = '/cgi-bin/fm170_api.cgi';
+  const nativeFetch = window.fetch.bind(window);
+  const CACHE_KEY = 'fm170_status_cache_v1';
+  let statusCache = null;
+  try { statusCache = localStorage.getItem(CACHE_KEY) || null; } catch (_) {}
+  let firstStatus = true;
+  const isStatus = (url) => /fm170_api\.cgi\?[^#]*action=status(?:&|$)/.test(String(url));
+  const lease = (action) => nativeFetch(`${API}?action=${action}&ts=${Date.now()}`, {cache:'no-store', keepalive:true}).catch(()=>{});
+  lease('ui_open');
+  const leaseTimer = setInterval(() => lease('ui_open'), 20000);
+  window.addEventListener('pagehide', () => { clearInterval(leaseTimer); lease('ui_close'); });
+
+  window.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (isStatus(url) && !firstStatus) {
+      // 给原页面返回上一次状态，避免它的内部定时器继续触发真实 API/串口采集。
+      if (statusCache) return new Response(statusCache, {status:200, headers:{'Content-Type':'application/json'}});
+      return new Response(JSON.stringify({ok:true,fresh:false,raw:{}}), {status:200, headers:{'Content-Type':'application/json'}});
+    }
+    if (isStatus(url)) firstStatus = false;
+    let response;
+    try {
+      response = await nativeFetch(input, init);
+    } catch (e) {
+      if (isStatus(url) && statusCache) return new Response(statusCache, {status:200, headers:{'Content-Type':'application/json'}});
+      throw e;
+    }
+    if (isStatus(url)) {
+      try {
+        const body = await response.clone().text();
+        if (body && body.length > 20) {
+          statusCache = body;
+          try { localStorage.setItem(CACHE_KEY, body); } catch (_) {}
+        }
+      } catch (_) {}
+    }
+    return response;
+  };
+
+  function addRefreshButton() {
+    if (document.getElementById('fm170-manual-refresh')) return;
+    const b = document.createElement('button');
+    b.id = 'fm170-manual-refresh'; b.type = 'button'; b.textContent = '↻ 手动刷新';
+    b.title = '仅在点击时读取模块状态';
+    b.onclick = () => { b.disabled = true; b.textContent = '读取中…'; lease('ui_refresh'); setTimeout(() => location.reload(), 80); };
+    document.body.appendChild(b);
+  }
+  const style = document.createElement('style'); style.textContent = `#fm170-manual-refresh{position:fixed;right:18px;top:16px;z-index:20;border:1px solid #2f9e5b;background:#14241a;color:#dff8e7;border-radius:8px;padding:8px 13px;font-weight:650;cursor:pointer;box-shadow:0 4px 18px #0003}#fm170-manual-refresh:disabled{opacity:.65}@media(max-width:600px){#fm170-manual-refresh{top:auto;right:12px;bottom:72px;padding:9px 12px;font-size:12px}}`; document.head.appendChild(style);
+  new MutationObserver(addRefreshButton).observe(document.documentElement, {childList:true, subtree:true});
+  addRefreshButton();
+})();
+
+/* 高级 AT 控制：常用命令下拉 + 任意单行 AT 命令。 */
+(() => {
+  const CONTROL = '/cgi-bin/fm170_control.cgi';
+  const presets = [
+    ['AT+CSQ','查询信号强度'],['AT+CESQ','查询扩展信号质量'],['AT+COPS?','查询运营商'],['AT+CEREG?','查询 LTE 注册'],['AT+C5GREG?','查询 5G 注册'],['AT+CGREG?','查询 GPRS 注册'],['AT+GTCCINFO?','查询服务小区'],['AT+GTCAINFO?','查询载波聚合'],['AT+GTCELLLOCK?','查询小区锁定'],['AT+GTPLMNLOCK?','查询 PLMN 锁定'],['AT+GTACT?','查询网络模式'],['AT+CGDCONT?','查询 PDP/APN'],['AT+CGCONTRDP','查询地址/DNS'],['AT+CGMM','查询模块型号'],['AT+CGMR','查询固件版本'],['AT+CFUN?','查询功能状态'],['AT+CFUN=15','重新注册网络']
+  ];
+  const esc = x => String(x).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  function panel(){
+    if (document.getElementById('fm170-at-panel')) return;
+    const host = document.querySelector('.page') || document.querySelector('main') || document.body; if (!host) return;
+    const box=document.createElement('section'); box.id='fm170-at-panel'; box.innerHTML=`<div class="fm170-at-title">AT 控制 <span>直接通过 FM170 串口队列执行</span></div><div class="fm170-at-row"><select id="fm170-at-preset"><option value="">选择常用 AT 指令…</option>${presets.map(x=>`<option value="${esc(x[0])}">${esc(x[0])} — ${esc(x[1])}</option>`).join('')}</select><input id="fm170-at-input" value="" placeholder="或输入任意单行 AT 指令，例如 AT+CSQ"><button id="fm170-at-send">发送</button></div><div id="fm170-at-output" class="fm170-at-output">等待执行…</div>`;
+    host.appendChild(box);
+    box.querySelector('#fm170-at-preset').onchange=e=>{box.querySelector('#fm170-at-input').value=e.target.value};
+    box.querySelector('#fm170-at-send').onclick=async()=>{const cmd=box.querySelector('#fm170-at-input').value.trim();const out=box.querySelector('#fm170-at-output');if(!/^AT(?:\+.*)?$/i.test(cmd)||/[\r\n&|;`$()]/.test(cmd)){out.textContent='请输入以 AT 开头的单行指令';return}out.textContent='执行中…';const sid=localStorage.getItem('fm170_webui_control_session')||'';try{const r=await fetch(`${CONTROL}?action=at&cmd=${encodeURIComponent(cmd)}&sid=${encodeURIComponent(sid)}`,{cache:'no-store'});const body=await r.text();let data;try{data=JSON.parse(body)}catch(_){data={raw:body}}out.textContent=(data&&typeof data.raw==='string')?data.raw:(data&&data.error)||''}catch(e){out.textContent=String(e)}};
+  }
+  const st=document.createElement('style');st.textContent=`#fm170-at-panel{margin:18px 0;padding:16px;border:1px solid #2b3a31;border-radius:10px;background:#101613;color:#dce8df}#fm170-at-panel .fm170-at-title{font-weight:700;margin-bottom:12px}#fm170-at-panel .fm170-at-title span{font-size:12px;color:#8d9b91;font-weight:400;margin-left:8px}.fm170-at-row{display:flex;gap:8px;flex-wrap:wrap}.fm170-at-row select,.fm170-at-row input{min-width:180px;flex:1;background:#18221c;color:#e7f1e9;border:1px solid #3a4b40;border-radius:6px;padding:8px}.fm170-at-row button{background:#2f9e5b;color:#fff;border:0;border-radius:6px;padding:8px 16px;font-weight:700}#fm170-at-panel .fm170-at-output{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;max-height:220px;overflow:auto;background:#0a0d0b;border-radius:6px;padding:10px;margin:12px 0 0;color:#b9efc5;font-size:12px;line-height:1.55;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}@media(max-width:600px){#fm170-at-panel{margin:12px 0;padding:12px}.fm170-at-row{display:grid;grid-template-columns:1fr}.fm170-at-row select,.fm170-at-row input,.fm170-at-row button{width:100%;min-width:0}}`;document.head.appendChild(st);
+  new MutationObserver(panel).observe(document.documentElement,{childList:true,subtree:true}); panel();
+})();
